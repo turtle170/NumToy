@@ -1,4 +1,4 @@
-# NumToy
+# NumToy [![CI](https://github.com/turtle170/NumToy/actions/workflows/ci.yml/badge.svg)](https://github.com/turtle170/NumToy/actions/workflows/ci.yml)
 
 A compiler-grade, multi-language numerical engine with hybrid Rust + Zig architecture.
 
@@ -10,6 +10,15 @@ A compiler-grade, multi-language numerical engine with hybrid Rust + Zig archite
 | `numtoy-core/` | Rust | IR, two-stage fuser (Cranelift JIT + WebGPU), auto-diff, Python/C ABI |
 | `numtoy-python/` | Python + PyO3 | Maturin wheel – `@nt.compile` decorator, `Tensor` API |
 | `numtoy-cpp/` | C++ | Header-only RAII wrapper – operator overloads, lazy graph building |
+
+## Platform Support
+
+| Operating System | Architecture | Vector Engine | GPU Backend |
+|---|---|---|---|
+| **Windows** | `x86_64` | SSE2 / AVX | WebGPU (DX12 / Vulkan) |
+| **Linux** | `x86_64`, `ARM64` (`aarch64`) | SSE2 / AVX, ARM NEON | WebGPU (Vulkan) |
+| **macOS** | `x86_64`, Apple Silicon (`aarch64`) | SSE2, ARM NEON | WebGPU (Metal) |
+
 
 ## Features
 

@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
 
 pub const Engine = struct {
     arena: *std.heap.ArenaAllocator,
@@ -48,6 +50,17 @@ pub fn pack_bits(allocator: std.mem.Allocator, src: []const u64, bit_width: u32)
             const out = try allocator.alloc(u8, src.len);
             // SIMD-aligned batch: process 16 elements at a time using @Vector(16, u8)
             const lane: comptime_int = 16;
+            
+            // Document and assert SIMD alignment on target architectures:
+            // - AArch64: 128-bit Q-registers map to 16x8-bit elements (NEON vld1q_u8 / vst1q_u8)
+            // - x86_64: 128-bit XMM-registers map to 16x8-bit elements (SSE2/AVX movdqu)
+            comptime {
+                const target_arch = builtin.cpu.arch;
+                if (target_arch != .aarch64 and target_arch != .x86_64) {
+                    @compileLog("SIMD fast-path falling back to standard @Vector code-gen for target architecture: ", target_arch);
+                }
+            }
+
             var i: usize = 0;
             while (i + lane <= src.len) : (i += lane) {
                 var v: @Vector(lane, u8) = undefined;

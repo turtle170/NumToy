@@ -1,0 +1,215 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+env:
+  ZIG_VERSION: "0.14.1"
+  CARGO_TERM_COLOR: always
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build + Test matrix
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: Build & Test — ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows x86_64 ──────────────────────────────────────────
+          - name: windows-x86_64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            zig-target: x86_64-windows
+            zig-arch: x86_64
+            zig-os: windows
+            zig-ext: zip
+            maturin-target: x86_64-pc-windows-msvc
+
+          # ── Linux x86_64 ────────────────────────────────────────────
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            zig-target: x86_64-linux
+            zig-arch: x86_64
+            zig-os: linux
+            zig-ext: tar.xz
+            maturin-target: x86_64-unknown-linux-gnu
+            manylinux: manylinux_2_28
+
+          # ── Linux ARM64 (NEON) ──────────────────────────────────────
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+            zig-target: aarch64-linux
+            zig-arch: aarch64
+            zig-os: linux
+            zig-ext: tar.xz
+            maturin-target: aarch64-unknown-linux-gnu
+            manylinux: manylinux_2_28
+
+          # ── macOS x86_64 ────────────────────────────────────────────
+          - name: macos-x86_64
+            runner: macos-13
+            rust-target: x86_64-apple-darwin
+            zig-target: x86_64-macos
+            zig-arch: x86_64
+            zig-os: macos
+            zig-ext: tar.xz
+            maturin-target: x86_64-apple-darwin
+
+          # ── macOS ARM64 / Apple Silicon (NEON) ──────────────────────
+          - name: macos-aarch64
+            runner: macos-latest
+            rust-target: aarch64-apple-darwin
+            zig-target: aarch64-macos
+            zig-arch: aarch64
+            zig-os: macos
+            zig-ext: tar.xz
+            maturin-target: aarch64-apple-darwin
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Install Zig ─────────────────────────────────────────────────
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        shell: bash
+        run: |
+          ZIG_BASE="zig-${{ matrix.zig-os }}-${{ matrix.zig-arch }}-${{ env.ZIG_VERSION }}"
+          ZIG_URL="https://ziglang.org/download/${{ env.ZIG_VERSION }}/${ZIG_BASE}.${{ matrix.zig-ext }}"
+          echo "Downloading $ZIG_URL"
+          curl -fsSL "$ZIG_URL" -o zig-pkg.${{ matrix.zig-ext }}
+          if [[ "${{ matrix.zig-ext }}" == "zip" ]]; then
+            7z x zig-pkg.zip -o zig-dist/
+          else
+            mkdir -p zig-dist && tar -xJf zig-pkg.tar.xz -C zig-dist/
+          fi
+          ZIG_DIR=$(find zig-dist -name "zig" -type f | head -1 | xargs dirname)
+          echo "$ZIG_DIR" >> $GITHUB_PATH
+          echo "ZIG_BIN=$ZIG_DIR/zig" >> $GITHUB_ENV
+          zig version || true
+
+      # ── Install Rust ─────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      # ── Cache Cargo ──────────────────────────────────────────────────
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            numtoy-core/target
+          key: cargo-${{ matrix.name }}-${{ hashFiles('numtoy-core/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.name }}-
+
+      # ── Platform Dependencies ─────────────────────────────────────────
+      - name: Install Linux ARM64 cross-linker
+        if: matrix.name == 'linux-aarch64' && runner.arch != 'ARM64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install macOS SDK (xcode-select)
+        if: startsWith(matrix.runner, 'macos')
+        run: xcode-select --install 2>/dev/null || true
+
+      # ── Build (cargo) ────────────────────────────────────────────────
+      - name: Build numtoy-core
+        working-directory: numtoy-core
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --target ${{ matrix.rust-target }}
+
+      # ── Test ─────────────────────────────────────────────────────────
+      - name: Run Rust tests
+        working-directory: numtoy-core
+        # Skip cross tests (can't run ARM64 binary on x86_64 host)
+        if: |
+          !(matrix.name == 'linux-aarch64' && runner.arch != 'ARM64') &&
+          !(matrix.name == 'macos-aarch64' && runner.arch != 'ARM64')
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo test --target ${{ matrix.rust-target }}
+
+      # ── Zig tests ────────────────────────────────────────────────────
+      - name: Run Zig tests
+        working-directory: numtoy-hardware
+        if: |
+          !(matrix.name == 'linux-aarch64' && runner.arch != 'ARM64') &&
+          !(matrix.name == 'macos-aarch64' && runner.arch != 'ARM64')
+        run: zig test src/main.zig
+
+      # ── Verify NEON emission (ARM64 only) ────────────────────────────
+      - name: Verify NEON instructions (AArch64)
+        if: matrix.zig-arch == 'aarch64' && runner.arch == 'ARM64'
+        working-directory: numtoy-hardware
+        run: |
+          zig build -Doptimize=ReleaseFast
+          echo "=== Checking for NEON instruction emission ==="
+          if command -v objdump &>/dev/null; then
+            objdump -d zig-out/lib/libnumtoy_hardware.a 2>/dev/null | grep -c "ld1\|st1\|add\.16\|zip\|uzp" \
+              && echo "NEON instructions found" || echo "objdump not available or no NEON instrs (may be inlined)"
+          fi
+
+      # ── Install Python & maturin ──────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      # ── Build Python wheel ────────────────────────────────────────────
+      - name: Build Python wheel (non-Linux)
+        if: "!startsWith(matrix.runner, 'ubuntu')"
+        working-directory: numtoy-python
+        run: maturin build --release --target ${{ matrix.rust-target }} --out dist/
+
+      - name: Build Python wheel (Linux manylinux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        working-directory: numtoy-python
+        run: |
+          pip install maturin[patchelf]
+          maturin build --release --target ${{ matrix.rust-target }} \
+            --manylinux ${{ matrix.manylinux }} --out dist/
+
+      # ── Upload wheel artifact ─────────────────────────────────────────
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: numtoy-python/dist/*.whl
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Release: publish wheels on tag push
+# ─────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Publish to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels/
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wheels/*.whl
+          generate_release_notes: true

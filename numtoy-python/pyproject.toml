@@ -13,3 +13,6 @@ dependencies = []
 features = ["pyo3/extension-module"]
 manifest-path = "../numtoy-core/Cargo.toml"
 module-name = "numtoy.numtoy_core"
+universal2 = false
+manylinux = "2_28"
+

@@ -11,9 +11,44 @@ fn main() {
     let cargo_manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let zig_dir = Path::new(&cargo_manifest_dir).parent().unwrap().join("numtoy-hardware");
 
-    // 1. Run zig build in numtoy-hardware
-    let status = Command::new("zig")
-        .args(&["build", "-Doptimize=ReleaseFast"])
+    // 1. Find Zig executable
+    let zig_bin = env::var("ZIG").unwrap_or_else(|_| "zig".to_string());
+    let test_zig = Command::new(&zig_bin)
+        .arg("version")
+        .status();
+    if test_zig.is_err() || !test_zig.unwrap().success() {
+        panic!(
+            "Could not find or execute `zig`. Please ensure Zig is installed and on your PATH, or set the ZIG environment variable to point to the Zig executable."
+        );
+    }
+
+    // Determine target triple from CARGO build environment
+    let target = env::var("TARGET").unwrap_or_else(|_| "x86_64-pc-windows-msvc".to_string());
+    let mut args = vec!["build".to_string(), "-Doptimize=ReleaseFast".to_string()];
+
+    let zig_target = if target.contains("aarch64-unknown-linux-gnu") {
+        Some("aarch64-linux-gnu")
+    } else if target.contains("x86_64-unknown-linux-gnu") {
+        Some("x86_64-linux-gnu")
+    } else if target.contains("aarch64-apple-darwin") {
+        Some("aarch64-macos")
+    } else if target.contains("x86_64-apple-darwin") {
+        Some("x86_64-macos")
+    } else if target.contains("x86_64-pc-windows-msvc") {
+        Some("x86_64-windows-msvc")
+    } else if target.contains("x86_64-pc-windows-gnu") {
+        Some("x86_64-windows-gnu")
+    } else {
+        None
+    };
+
+    if let Some(zt) = zig_target {
+        args.push(format!("-Dtarget={}", zt));
+    }
+
+    // Run zig build in numtoy-hardware
+    let status = Command::new(&zig_bin)
+        .args(&args)
         .current_dir(&zig_dir)
         .status()
         .expect("Failed to execute zig build");
@@ -23,6 +58,15 @@ fn main() {
     let lib_dir = zig_dir.join("zig-out").join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.to_str().unwrap());
     println!("cargo:rustc-link-lib=static=numtoy_hardware");
+
+    // Platform-specific linker flags for downstream targets
+    if target.contains("apple") || target.contains("darwin") {
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    } else if target.contains("linux") {
+        println!("cargo:rustc-link-lib=dl");
+        println!("cargo:rustc-link-lib=pthread");
+        println!("cargo:rustc-link-lib=m");
+    }
 
     // 3. Write C header for the C++ wrapper
     // We maintain numtoy.h manually here rather than via cbindgen, because
