@@ -6,6 +6,8 @@ use crate::cache::{JIT_CACHE, hash_graph, ExecFn};
 use crate::fuser::compile_packed_kernel;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[repr(align(64))]
+#[derive(Clone)]
 pub enum Task {
     Tile { graph: Arc<ArenaGraph>, hash: [u8; 32] },
     Fuse { graph: Arc<ArenaGraph>, hash: [u8; 32] },
