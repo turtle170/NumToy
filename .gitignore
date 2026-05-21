@@ -1,0 +1,35 @@
+# Rust/Cargo build artifacts
+numtoy-core/target/
+
+# Zig build artifacts
+numtoy-hardware/zig-cache/
+numtoy-hardware/.zig-cache/
+numtoy-hardware/zig-out/
+
+# Python build artifacts
+numtoy-python/__pycache__/
+numtoy-python/.venv/
+*.whl
+*.egg-info/
+dist/
+build/
+**/__pycache__/
+**/*.pyc
+
+# C++ build artifacts
+numtoy-cpp/test_numtoy.exe
+numtoy-cpp/numtoy_core.dll
+numtoy-cpp/*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Windows artifacts
+Thumbs.db
+Desktop.ini
+
+# antigravity internal
+.antigravitycli/

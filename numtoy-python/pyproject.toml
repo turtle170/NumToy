@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "numtoy"
+version = "0.1.0"
+description = "A compiler-grade, multi-language numerical engine"
+requires-python = ">=3.8"
+dependencies = []
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "../numtoy-core/Cargo.toml"
+module-name = "numtoy.numtoy_core"
