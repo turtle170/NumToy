@@ -19,7 +19,15 @@ pub enum Expr {
         left: Arc<Expr>,
         right: Arc<Expr>,
     },
+    Sub {
+        left: Arc<Expr>,
+        right: Arc<Expr>,
+    },
     Mul {
+        left: Arc<Expr>,
+        right: Arc<Expr>,
+    },
+    Div {
         left: Arc<Expr>,
         right: Arc<Expr>,
     },
@@ -57,8 +65,22 @@ impl Expr {
         }
     }
 
+    pub fn sub(self, other: Expr) -> Self {
+        Expr::Sub {
+            left: Arc::new(self),
+            right: Arc::new(other),
+        }
+    }
+
     pub fn mul(self, other: Expr) -> Self {
         Expr::Mul {
+            left: Arc::new(self),
+            right: Arc::new(other),
+        }
+    }
+
+    pub fn div(self, other: Expr) -> Self {
+        Expr::Div {
             left: Arc::new(self),
             right: Arc::new(other),
         }
@@ -68,8 +90,8 @@ impl Expr {
         match self {
             Expr::Variable { dtype, .. } => *dtype,
             Expr::Constant { val } => val.data_type(),
-            Expr::Add { left, .. } => left.data_type(),
-            Expr::Mul { left, .. } => left.data_type(),
+            Expr::Add { left, .. } | Expr::Sub { left, .. }
+            | Expr::Mul { left, .. } | Expr::Div { left, .. } => left.data_type(),
         }
     }
 
@@ -77,15 +99,11 @@ impl Expr {
         match self {
             Expr::Variable { size, .. } => *size,
             Expr::Constant { .. } => 1,
-            Expr::Add { left, right } => {
-                let l_size = left.size();
-                let r_size = right.size();
-                if l_size > r_size { l_size } else { r_size }
-            }
-            Expr::Mul { left, right } => {
-                let l_size = left.size();
-                let r_size = right.size();
-                if l_size > r_size { l_size } else { r_size }
+            Expr::Add { left, right } | Expr::Sub { left, right }
+            | Expr::Mul { left, right } | Expr::Div { left, right } => {
+                let l = left.size();
+                let r = right.size();
+                if l > r { l } else { r }
             }
         }
     }
@@ -97,8 +115,10 @@ impl Expr {
                 Scalar::FloatingInt { scale, .. } => Some(*scale),
                 _ => None,
             },
-            Expr::Add { left, right } => left.get_scale().or_else(|| right.get_scale()),
-            Expr::Mul { left, right } => left.get_scale().or_else(|| right.get_scale()),
+            Expr::Add { left, right } | Expr::Sub { left, right }
+            | Expr::Mul { left, right } | Expr::Div { left, right } => {
+                left.get_scale().or_else(|| right.get_scale())
+            }
         }
     }
 
@@ -106,9 +126,65 @@ impl Expr {
         match self {
             Expr::Variable { steal_sign, .. } => *steal_sign,
             Expr::Constant { .. } => false,
-            Expr::Add { left, .. } => left.steal_sign(),
-            Expr::Mul { left, .. } => left.steal_sign(),
+            Expr::Add { left, .. } | Expr::Sub { left, .. }
+            | Expr::Mul { left, .. } | Expr::Div { left, .. } => left.steal_sign(),
+        }
+    }
+
+    /// Reverse-mode symbolic auto-differentiation.
+    ///
+    /// Returns the symbolic gradient of `self` with respect to the variable
+    /// whose `id == wrt_id`.  The returned expression can then be JIT-compiled
+    /// and executed exactly like any other `Expr`.
+    ///
+    /// Rules:
+    ///   d(Variable(id)) / d(id) = 1      (zero otherwise)
+    ///   d(Constant)     / d(id) = 0
+    ///   d(a + b)        / d(id) = da/dx + db/dx
+    ///   d(a - b)        / d(id) = da/dx - db/dx
+    ///   d(a * b)        / d(id) = a * db/dx + b * da/dx   (product rule)
+    ///   d(a / b)        / d(id) = (da/dx * b - a * db/dx) / b²  (quotient rule)
+    pub fn grad(&self, wrt_id: usize) -> Expr {
+        match self {
+            Expr::Variable { id, dtype, size, .. } => {
+                if *id == wrt_id {
+                    Expr::new_const(Scalar::Float(1.0, 32))
+                } else {
+                    Expr::new_const(Scalar::Float(0.0, 32))
+                }
+            }
+            Expr::Constant { .. } => Expr::new_const(Scalar::Float(0.0, 32)),
+
+            Expr::Add { left, right } => {
+                let dl = left.grad(wrt_id);
+                let dr = right.grad(wrt_id);
+                dl.add(dr)
+            }
+
+            Expr::Sub { left, right } => {
+                let dl = left.grad(wrt_id);
+                let dr = right.grad(wrt_id);
+                dl.sub(dr)
+            }
+
+            // Product rule: d(a*b)/dx = da/dx * b + a * db/dx
+            Expr::Mul { left, right } => {
+                let dl = left.grad(wrt_id);
+                let dr = right.grad(wrt_id);
+                let term1 = dl.mul((**right).clone());
+                let term2 = (**left).clone().mul(dr);
+                term1.add(term2)
+            }
+
+            // Quotient rule: d(a/b)/dx = (da/dx * b - a * db/dx) / b²
+            Expr::Div { left, right } => {
+                let dl = left.grad(wrt_id);
+                let dr = right.grad(wrt_id);
+                let b = (**right).clone();
+                let b_sq = b.clone().mul(b.clone());
+                let numer = dl.mul(b).sub((**left).clone().mul(dr));
+                numer.div(b_sq)
+            }
         }
     }
 }
-

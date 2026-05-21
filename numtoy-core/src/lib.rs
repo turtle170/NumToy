@@ -2,35 +2,29 @@ pub mod types;
 pub mod hardware;
 pub mod ir;
 pub mod fuser;
+pub mod tensor;
 
 use pyo3::prelude::*;
 use crate::types::{DataType, Scalar};
 use crate::hardware::HardwareEngine;
 use crate::ir::Expr;
 use crate::fuser::execute_expr_on_device;
+use crate::tensor::Tensor;
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────
 // AdaptableFloat Sign Stealer analysis
-// Checks whether all values in a float dataset are non-negative.
-// If yes, the sign bit is discarded and shifted to the mantissa.
 // ─────────────────────────────────────────────────────────
 fn should_steal_sign(dtype: DataType, values: &[f64]) -> bool {
     match dtype {
         DataType::Float(_) | DataType::DynamicFloat => values.iter().all(|&v| v >= 0.0),
-        _ => false, // Int & FloatingInt have their own sign representations
+        _ => false,
     }
 }
 
 // ─────────────────────────────────────────────────────────
-// Python bindings
+// Python: PyEngine
 // ─────────────────────────────────────────────────────────
-
-#[pyclass]
-#[derive(Clone)]
-pub struct PyExpr {
-    pub inner: Expr,
-}
 
 #[pyclass]
 pub struct PyEngine {
@@ -41,10 +35,18 @@ pub struct PyEngine {
 impl PyEngine {
     #[new]
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(HardwareEngine::new()),
-        }
+        Self { inner: Arc::new(HardwareEngine::new()) }
     }
+}
+
+// ─────────────────────────────────────────────────────────
+// Python: PyExpr
+// ─────────────────────────────────────────────────────────
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyExpr {
+    pub inner: Expr,
 }
 
 #[pymethods]
@@ -60,61 +62,61 @@ impl PyExpr {
         scale: Option<u32>,
     ) -> Self {
         let dtype = match dtype_str {
-            "float" => DataType::Float(bits),
-            "int" => DataType::Int(bits),
-            "dynamic_float" => DataType::DynamicFloat,
+            "float"        => DataType::Float(bits),
+            "int"          => DataType::Int(bits),
+            "dynamic_float"=> DataType::DynamicFloat,
             "floating_int" => DataType::FloatingInt,
-            _ => panic!("Unknown datatype: {}", dtype_str),
+            _              => panic!("Unknown datatype: {}", dtype_str),
         };
 
-        // ── AdaptableFloat Sign Stealer check ──
         let steal_sign = should_steal_sign(dtype, &values);
         if steal_sign {
             eprintln!("[NumToy] Sign Stealer activated for '{}': all values non-negative, \
                        sign bit reallocated to mantissa for +1 bit of precision", name);
         }
 
-        let scalars: Vec<Scalar> = values
-            .iter()
-            .map(|&v| match dtype {
-                DataType::Float(b) => Scalar::Float(v, b),
-                DataType::Int(b) => Scalar::Int(v.round() as i64, b),
-                DataType::DynamicFloat => Scalar::DynamicFloat(v),
-                DataType::FloatingInt => crate::types::double_to_floating_int(v, scale.unwrap_or(1)),
-            })
-            .collect();
+        let scalars: Vec<Scalar> = values.iter().map(|&v| match dtype {
+            DataType::Float(b)  => Scalar::Float(v, b),
+            DataType::Int(b)    => Scalar::Int(v.round() as i64, b),
+            DataType::DynamicFloat => Scalar::DynamicFloat(v),
+            DataType::FloatingInt  => crate::types::double_to_floating_int(v, scale.unwrap_or(1)),
+        }).collect();
 
         let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal_sign)).collect();
         let bit_width = match dtype {
-            DataType::Float(b) => b,
-            DataType::Int(b) => b,
-            DataType::DynamicFloat => 64,
-            DataType::FloatingInt => 64,
+            DataType::Float(b)  => b,
+            DataType::Int(b)    => b,
+            DataType::DynamicFloat | DataType::FloatingInt => 64,
         };
         let packed = engine.inner.pack(&u64s, bit_width);
 
-        Self {
-            inner: Expr::new_var(id, &name, dtype, values.len(), packed, scale, steal_sign),
-        }
+        Self { inner: Expr::new_var(id, &name, dtype, values.len(), packed, scale, steal_sign) }
     }
 
     #[staticmethod]
     pub fn new_const(value: f64) -> Self {
-        Self {
-            inner: Expr::new_const(Scalar::DynamicFloat(value)),
-        }
+        Self { inner: Expr::new_const(Scalar::DynamicFloat(value)) }
     }
 
     pub fn add(&self, other: &PyExpr) -> Self {
-        Self {
-            inner: self.inner.clone().add(other.inner.clone()),
-        }
+        Self { inner: self.inner.clone().add(other.inner.clone()) }
+    }
+
+    pub fn sub(&self, other: &PyExpr) -> Self {
+        Self { inner: self.inner.clone().sub(other.inner.clone()) }
     }
 
     pub fn mul(&self, other: &PyExpr) -> Self {
-        Self {
-            inner: self.inner.clone().mul(other.inner.clone()),
-        }
+        Self { inner: self.inner.clone().mul(other.inner.clone()) }
+    }
+
+    pub fn div(&self, other: &PyExpr) -> Self {
+        Self { inner: self.inner.clone().div(other.inner.clone()) }
+    }
+
+    /// Symbolic gradient: returns d(self)/d(var_id) as a new PyExpr.
+    pub fn grad(&self, wrt_id: usize) -> Self {
+        Self { inner: self.inner.grad(wrt_id) }
     }
 
     #[pyo3(signature = (engine, device = "cpu"))]
@@ -128,25 +130,119 @@ impl PyExpr {
             Expr::Variable { dtype, size, packed_data, scale, steal_sign, .. } => {
                 let bit_width = match dtype {
                     DataType::Float(b) => *b,
-                    DataType::Int(b) => *b,
-                    DataType::DynamicFloat => 64,
-                    DataType::FloatingInt => 64,
+                    DataType::Int(b)   => *b,
+                    DataType::DynamicFloat | DataType::FloatingInt => 64,
                 };
-                let raw_u64s = engine.inner.unpack(packed_data, *size, bit_width);
-                raw_u64s
-                    .into_iter()
+                let raw = engine.inner.unpack(packed_data, *size, bit_width);
+                raw.into_iter()
                     .map(|u| Scalar::from_u64_packed(u, *dtype, *scale, *steal_sign).to_double())
                     .collect()
             }
-            _ => panic!("Cannot unpack non-variable expression"),
+            _ => panic!("Cannot unpack non-variable expression; call execute() first"),
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────
+// Python: PyTensor
+// ─────────────────────────────────────────────────────────
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyTensor {
+    pub inner: Tensor,
+}
+
+#[pymethods]
+impl PyTensor {
+    #[staticmethod]
+    pub fn from_values(
+        engine: &PyEngine,
+        id: usize,
+        name: String,
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        dtype_str: &str,
+        bits: u32,
+        scale: Option<u32>,
+    ) -> Self {
+        let dtype = match dtype_str {
+            "float"         => DataType::Float(bits),
+            "int"           => DataType::Int(bits),
+            "dynamic_float" => DataType::DynamicFloat,
+            "floating_int"  => DataType::FloatingInt,
+            _               => panic!("Unknown datatype: {}", dtype_str),
+        };
+
+        let steal_sign = should_steal_sign(dtype, &values);
+        let scalars: Vec<Scalar> = values.iter().map(|&v| match dtype {
+            DataType::Float(b)  => Scalar::Float(v, b),
+            DataType::Int(b)    => Scalar::Int(v.round() as i64, b),
+            DataType::DynamicFloat => Scalar::DynamicFloat(v),
+            DataType::FloatingInt  => crate::types::double_to_floating_int(v, scale.unwrap_or(1)),
+        }).collect();
+
+        let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal_sign)).collect();
+        let bit_width = match dtype {
+            DataType::Float(b) | DataType::Int(b) => b,
+            _ => 64,
+        };
+        let packed = engine.inner.pack(&u64s, bit_width);
+        let expr = Expr::new_var(id, &name, dtype, values.len(), packed, scale, steal_sign);
+        Self { inner: Tensor::from_expr(expr, shape) }
+    }
+
+    pub fn shape(&self) -> Vec<usize> {
+        self.inner.shape.clone()
+    }
+
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Self {
+        Self { inner: self.inner.reshape(new_shape) }
+    }
+
+    pub fn broadcast_to(&self, engine: &PyEngine, target_shape: Vec<usize>) -> Self {
+        Self { inner: self.inner.broadcast_to(&engine.inner, target_shape) }
+    }
+
+    pub fn add_tensor(&self, other: &PyTensor, engine: &PyEngine) -> Self {
+        Self { inner: self.inner.add(&other.inner, &engine.inner) }
+    }
+
+    pub fn sub_tensor(&self, other: &PyTensor, engine: &PyEngine) -> Self {
+        Self { inner: self.inner.sub(&other.inner, &engine.inner) }
+    }
+
+    pub fn mul_tensor(&self, other: &PyTensor, engine: &PyEngine) -> Self {
+        Self { inner: self.inner.mul(&other.inner, &engine.inner) }
+    }
+
+    pub fn div_tensor(&self, other: &PyTensor, engine: &PyEngine) -> Self {
+        Self { inner: self.inner.div(&other.inner, &engine.inner) }
+    }
+
+    pub fn grad(&self, wrt_id: usize) -> Self {
+        Self { inner: self.inner.grad(wrt_id) }
+    }
+
+    #[pyo3(signature = (engine, device = "cpu"))]
+    pub fn execute(&self, engine: &PyEngine, device: &str) -> Self {
+        Self { inner: self.inner.execute(&engine.inner, device) }
+    }
+
+    pub fn to_flat_f64(&self, engine: &PyEngine) -> Vec<f64> {
+        self.inner.to_flat_f64(&engine.inner)
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// Python module
+// ─────────────────────────────────────────────────────────
 
 #[pymodule]
 fn numtoy_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
     m.add_class::<PyExpr>()?;
+    m.add_class::<PyTensor>()?;
     Ok(())
 }
 
@@ -161,9 +257,7 @@ pub unsafe extern "C" fn nt_engine_new() -> *mut HardwareEngine {
 
 #[no_mangle]
 pub unsafe extern "C" fn nt_engine_free(engine: *mut HardwareEngine) {
-    if !engine.is_null() {
-        let _ = Box::from_raw(engine);
-    }
+    if !engine.is_null() { let _ = Box::from_raw(engine); }
 }
 
 #[no_mangle]
@@ -171,18 +265,15 @@ pub unsafe extern "C" fn nt_expr_new_var(
     engine: *mut HardwareEngine,
     id: usize,
     name: *const libc::c_char,
-    dtype_val: u32, // 0 = Float, 1 = Int, 2 = DynamicFloat, 3 = FloatingInt
+    dtype_val: u32,
     bits: u32,
     values: *const f64,
     count: usize,
     scale: u32,
 ) -> *mut Expr {
     let engine_ref = &*engine;
-    let name_str = if name.is_null() {
-        "var"
-    } else {
-        std::ffi::CStr::from_ptr(name).to_str().unwrap_or("var")
-    };
+    let name_str = if name.is_null() { "var" }
+    else { std::ffi::CStr::from_ptr(name).to_str().unwrap_or("var") };
 
     let dtype = match dtype_val {
         0 => DataType::Float(bits),
@@ -191,79 +282,70 @@ pub unsafe extern "C" fn nt_expr_new_var(
         3 => DataType::FloatingInt,
         _ => DataType::DynamicFloat,
     };
-
     let slice = std::slice::from_raw_parts(values, count);
-
-    // ── AdaptableFloat Sign Stealer check ──
     let steal_sign = should_steal_sign(dtype, slice);
-
-    let scalars: Vec<Scalar> = slice
-        .iter()
-        .map(|&v| match dtype {
-            DataType::Float(b) => Scalar::Float(v, b),
-            DataType::Int(b) => Scalar::Int(v.round() as i64, b),
-            DataType::DynamicFloat => Scalar::DynamicFloat(v),
-            DataType::FloatingInt => crate::types::double_to_floating_int(v, scale),
-        })
-        .collect();
-
+    let scalars: Vec<Scalar> = slice.iter().map(|&v| match dtype {
+        DataType::Float(b)  => Scalar::Float(v, b),
+        DataType::Int(b)    => Scalar::Int(v.round() as i64, b),
+        DataType::DynamicFloat => Scalar::DynamicFloat(v),
+        DataType::FloatingInt  => crate::types::double_to_floating_int(v, scale),
+    }).collect();
     let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal_sign)).collect();
     let bit_width = match dtype {
-        DataType::Float(b) => b,
-        DataType::Int(b) => b,
-        DataType::DynamicFloat => 64,
-        DataType::FloatingInt => 64,
+        DataType::Float(b) | DataType::Int(b) => b,
+        _ => 64,
     };
     let packed = engine_ref.pack(&u64s, bit_width);
-
     let expr = Expr::new_var(id, name_str, dtype, count, packed, Some(scale), steal_sign);
     Box::into_raw(Box::new(expr))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nt_expr_new_const(val: f64) -> *mut Expr {
-    let expr = Expr::new_const(Scalar::DynamicFloat(val));
-    Box::into_raw(Box::new(expr))
+    Box::into_raw(Box::new(Expr::new_const(Scalar::DynamicFloat(val))))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nt_expr_add(left: *mut Expr, right: *mut Expr) -> *mut Expr {
-    let l = (*left).clone();
-    let r = (*right).clone();
-    let expr = l.add(r);
-    Box::into_raw(Box::new(expr))
+    Box::into_raw(Box::new((*left).clone().add((*right).clone())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nt_expr_sub(left: *mut Expr, right: *mut Expr) -> *mut Expr {
+    Box::into_raw(Box::new((*left).clone().sub((*right).clone())))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nt_expr_mul(left: *mut Expr, right: *mut Expr) -> *mut Expr {
-    let l = (*left).clone();
-    let r = (*right).clone();
-    let expr = l.mul(r);
-    Box::into_raw(Box::new(expr))
+    Box::into_raw(Box::new((*left).clone().mul((*right).clone())))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nt_expr_div(left: *mut Expr, right: *mut Expr) -> *mut Expr {
+    Box::into_raw(Box::new((*left).clone().div((*right).clone())))
+}
+
+/// Returns the symbolic gradient d(expr)/d(wrt_id) as a new Expr*.
+#[no_mangle]
+pub unsafe extern "C" fn nt_expr_grad(expr: *mut Expr, wrt_id: usize) -> *mut Expr {
+    Box::into_raw(Box::new((*expr).grad(wrt_id)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nt_expr_free(expr: *mut Expr) {
-    if !expr.is_null() {
-        let _ = Box::from_raw(expr);
-    }
+    if !expr.is_null() { let _ = Box::from_raw(expr); }
 }
 
-/// device_str: null or "cpu" for CPU JIT, "gpu" for WebGPU
+/// device_str: NULL/"cpu" for Cranelift JIT, "gpu" for WebGPU
 #[no_mangle]
 pub unsafe extern "C" fn nt_expr_execute(
     engine: *mut HardwareEngine,
     expr: *mut Expr,
     device_str: *const libc::c_char,
 ) -> *mut Expr {
-    let engine_ref = &*engine;
-    let expr_ref = &*expr;
-    let device = if device_str.is_null() {
-        "cpu"
-    } else {
-        std::ffi::CStr::from_ptr(device_str).to_str().unwrap_or("cpu")
-    };
-    let result = execute_expr_on_device(engine_ref, expr_ref, device);
+    let device = if device_str.is_null() { "cpu" }
+    else { std::ffi::CStr::from_ptr(device_str).to_str().unwrap_or("cpu") };
+    let result = execute_expr_on_device(&*engine, &*expr, device);
     Box::into_raw(Box::new(result))
 }
 
@@ -274,20 +356,17 @@ pub unsafe extern "C" fn nt_expr_unpack(
     out_values: *mut f64,
     max_count: usize,
 ) -> usize {
-    let engine_ref = &*engine;
-    let expr_ref = &*expr;
-    match expr_ref {
+    match &*expr {
         Expr::Variable { dtype, size, packed_data, scale, steal_sign, .. } => {
             let bit_width = match dtype {
-                DataType::Float(b) => *b,
-                DataType::Int(b) => *b,
-                DataType::DynamicFloat => 64,
-                DataType::FloatingInt => 64,
+                DataType::Float(b) | DataType::Int(b) => *b,
+                _ => 64,
             };
-            let raw_u64s = engine_ref.unpack(packed_data, *size, bit_width);
+            let raw = (*engine).unpack(packed_data, *size, bit_width);
             let count = std::cmp::min(*size, max_count);
             for i in 0..count {
-                *out_values.add(i) = Scalar::from_u64_packed(raw_u64s[i], *dtype, *scale, *steal_sign).to_double();
+                *out_values.add(i) =
+                    Scalar::from_u64_packed(raw[i], *dtype, *scale, *steal_sign).to_double();
             }
             count
         }
@@ -295,55 +374,134 @@ pub unsafe extern "C" fn nt_expr_unpack(
     }
 }
 
+// ─────────────────────────────────────────────────────────
+// C-ABI: Tensor
+// ─────────────────────────────────────────────────────────
+
+#[repr(C)]
+pub struct CppTensor {
+    inner: Tensor,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nt_tensor_new(
+    engine: *mut HardwareEngine,
+    id: usize,
+    name: *const libc::c_char,
+    dtype_val: u32,
+    bits: u32,
+    values: *const f64,
+    count: usize,
+    scale: u32,
+    shape_ptr: *const usize,
+    shape_len: usize,
+) -> *mut CppTensor {
+    let expr_ptr = nt_expr_new_var(engine, id, name, dtype_val, bits, values, count, scale);
+    if expr_ptr.is_null() { return std::ptr::null_mut(); }
+    let expr = *Box::from_raw(expr_ptr);
+    let shape = std::slice::from_raw_parts(shape_ptr, shape_len).to_vec();
+    let tensor = Tensor::from_expr(expr, shape);
+    Box::into_raw(Box::new(CppTensor { inner: tensor }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nt_tensor_free(t: *mut CppTensor) {
+    if !t.is_null() { let _ = Box::from_raw(t); }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nt_tensor_grad(t: *mut CppTensor, wrt_id: usize) -> *mut CppTensor {
+    let grad_tensor = (*t).inner.grad(wrt_id);
+    Box::into_raw(Box::new(CppTensor { inner: grad_tensor }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nt_tensor_execute(
+    engine: *mut HardwareEngine,
+    t: *mut CppTensor,
+    device_str: *const libc::c_char,
+) -> *mut CppTensor {
+    let device = if device_str.is_null() { "cpu" }
+    else { std::ffi::CStr::from_ptr(device_str).to_str().unwrap_or("cpu") };
+    let result = (*t).inner.execute(&*engine, device);
+    Box::into_raw(Box::new(CppTensor { inner: result }))
+}
+
+// ─────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fuser::execute_expr_on_device;
 
+    fn make_var(engine: &HardwareEngine, id: usize, values: &[f64]) -> Expr {
+        let steal = values.iter().all(|&v| v >= 0.0);
+        let scalars: Vec<Scalar> = values.iter().map(|&v| Scalar::Float(v, 32)).collect();
+        let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal)).collect();
+        let packed = engine.pack(&u64s, 32);
+        Expr::new_var(id, &format!("v{id}"), DataType::Float(32), values.len(), packed, None, steal)
+    }
+
     #[test]
     fn test_end_to_end_jit_compilation() {
         let engine = HardwareEngine::new();
-
-        let x_vals = vec![1.0f64, 2.0, 3.0];
-        let y_vals = vec![4.0f64, 5.0, 6.0];
-
-        // All positive → sign stealer activates for Float32
-        let steal = true;
-
-        let x_scalars: Vec<Scalar> = x_vals.iter().map(|&v| Scalar::Float(v, 32)).collect();
-        let y_scalars: Vec<Scalar> = y_vals.iter().map(|&v| Scalar::Float(v, 32)).collect();
-
-        let x_u64s: Vec<u64> = x_scalars.iter().map(|s| s.to_u64_packed(steal)).collect();
-        let y_u64s: Vec<u64> = y_scalars.iter().map(|s| s.to_u64_packed(steal)).collect();
-
-        let x_packed = engine.pack(&x_u64s, 32);
-        let y_packed = engine.pack(&y_u64s, 32);
-
-        let x_expr = Expr::new_var(1, "x", DataType::Float(32), 3, x_packed, None, steal);
-        let y_expr = Expr::new_var(2, "y", DataType::Float(32), 3, y_packed, None, steal);
-
-        let const_expr = Expr::new_const(Scalar::DynamicFloat(2.0));
-        let add_expr = x_expr.add(y_expr);
-        let z_expr = add_expr.mul(const_expr);
-
-        let result_expr = execute_expr_on_device(&engine, &z_expr, "cpu");
-
-        match result_expr {
-            Expr::Variable { dtype, size, packed_data, scale, steal_sign, .. } => {
-                assert_eq!(dtype, DataType::Float(32));
+        let x = make_var(&engine, 1, &[1.0, 2.0, 3.0]);
+        let y = make_var(&engine, 2, &[4.0, 5.0, 6.0]);
+        let z = x.add(y).mul(Expr::new_const(Scalar::DynamicFloat(2.0)));
+        let result = execute_expr_on_device(&engine, &z, "cpu");
+        match result {
+            Expr::Variable { size, packed_data, dtype, scale, steal_sign, .. } => {
                 assert_eq!(size, 3);
-                let raw_u64s = engine.unpack(&packed_data, size, 32);
-                let results: Vec<f64> = raw_u64s
-                    .into_iter()
+                let raw = engine.unpack(&packed_data, size, 32);
+                let vals: Vec<f64> = raw.into_iter()
                     .map(|u| Scalar::from_u64_packed(u, dtype, scale, steal_sign).to_double())
                     .collect();
-                // With custom float encoding, allow small floating point error
-                for (got, expected) in results.iter().zip([10.0, 14.0, 18.0].iter()) {
-                    let err = (got - expected).abs();
-                    assert!(err < 0.1, "got {} expected {} (err {})", got, expected, err);
+                for (got, exp) in vals.iter().zip([10.0, 14.0, 18.0]) {
+                    assert!((got - exp).abs() < 0.1, "got {} expected {}", got, exp);
                 }
             }
-            _ => panic!("Expected Variable result"),
+            _ => panic!("expected Variable"),
+        }
+    }
+
+    #[test]
+    fn test_auto_diff_product_rule() {
+        // z = (x + y) * x   =>   dz/dx = 2*x + y
+        // At x=[2.0], y=[3.0]: dz/dx = 2*2 + 3 = 7
+        let engine = HardwareEngine::new();
+        let x = make_var(&engine, 1, &[2.0]);
+        let y = make_var(&engine, 2, &[3.0]);
+        let z = (x.clone().add(y.clone())).mul(x.clone());
+        let dz_dx = z.grad(1); // wrt x (id=1)
+        let result = execute_expr_on_device(&engine, &dz_dx, "cpu");
+        match result {
+            Expr::Variable { size, packed_data, dtype, scale, steal_sign, .. } => {
+                let raw = engine.unpack(&packed_data, size, 32);
+                let val = Scalar::from_u64_packed(raw[0], dtype, scale, steal_sign).to_double();
+                assert!((val - 7.0).abs() < 0.5, "d(z)/d(x) = {} expected 7.0", val);
+            }
+            _ => panic!("expected Variable"),
+        }
+    }
+
+    #[test]
+    fn test_tensor_broadcast_add() {
+        // a = [[1.0], [2.0], [3.0]]  shape [3,1]
+        // b = [[10.0, 20.0]]          shape [1,2]
+        // a + b should be [[11,21],[12,22],[13,23]]  shape [3,2]
+        let engine = HardwareEngine::new();
+        let a_expr = make_var(&engine, 1, &[1.0, 2.0, 3.0]);
+        let b_expr = make_var(&engine, 2, &[10.0, 20.0]);
+        let a = Tensor::from_expr(a_expr, vec![3, 1]);
+        let b = Tensor::from_expr(b_expr, vec![1, 2]);
+        let c = a.add(&b, &engine).execute(&engine, "cpu");
+        let flat = c.to_flat_f64(&engine);
+        assert_eq!(flat.len(), 6);
+        let expected = [11.0, 21.0, 12.0, 22.0, 13.0, 23.0];
+        for (got, exp) in flat.iter().zip(expected) {
+            assert!((got - exp).abs() < 0.5, "got {} expected {}", got, exp);
         }
     }
 }

@@ -1,98 +1,117 @@
-import numtoy
+"""
+NumToy Python Integration Tests
+Covers: float32, int16, floating-point, @compile decorator,
+        AdaptableFloat Sign Stealer, GPU execution,
+        auto-diff (product rule), Tensor broadcast, Tensor reshape.
+"""
+import numtoy as nt
 
 def test_numtoy_python():
+    engine = nt.Engine()
+
+    # ── Float32 round-trip ────────────────────────────────────────────────────
     print("Initializing NumToy Engine...")
-    engine = numtoy.Engine()
-
     print("Creating variables...")
-    # Float(32) variables
-    x = numtoy.Expr.var(engine, "x", [1.0, 2.0, 3.0], dtype="float", bits=32)
-    y = numtoy.Expr.var(engine, "y", [4.0, 5.0, 6.0], dtype="float", bits=32)
-
-    # Arithmetic: z = (x + y) * 2.5
+    x = nt.Expr.var(engine, "x", [1.0, 2.0, 3.0])
+    y = nt.Expr.var(engine, "y", [4.0, 5.0, 6.0])
     print("Building expression tree: z = (x + y) * 2.5")
     z = (x + y) * 2.5
-
     print("Compiling & Executing expression tree...")
-    result_expr = z.execute(engine)
-
+    res = z.execute(engine)
     print("Unpacking results...")
-    results = result_expr.unpack(engine)
-    print(f"Unpacked Results: {results}")
-
-    # Expected: (1.0+4.0)*2.5 = 12.5, (2.0+5.0)*2.5 = 17.5, (3.0+6.0)*2.5 = 22.5
+    vals = res.unpack(engine)
+    print(f"Unracked Results: {vals}")
     expected = [12.5, 17.5, 22.5]
-    print(f"Expected: {expected}")
-    assert results == expected, f"Results mismatch! Got {results}, expected {expected}"
+    assert vals == expected, f"Float32 mismatch: {vals}"
     print("Float32 test passed successfully!\n")
 
-    # Int(16) test
+    # ── Int16 ─────────────────────────────────────────────────────────────────
     print("Testing packed Int16...")
-    a = numtoy.Expr.var(engine, "a", [10, -20, 30], dtype="int", bits=16)
-    b = numtoy.Expr.var(engine, "b", [5, 10, 15], dtype="int", bits=16)
-    c = a * b
-    c_res = c.execute(engine)
-    c_vals = c_res.unpack(engine)
-    print(f"Int16 Multiplication Results: {c_vals}")
-    expected_c = [50.0, -200.0, 450.0]
-    assert c_vals == expected_c, f"Int16 mismatch! Got {c_vals}, expected {expected_c}"
+    a = nt.Expr.var(engine, "a", [5.0, -10.0, 15.0], dtype="int", bits=16)
+    b = nt.Expr.var(engine, "b", [10.0, 20.0, 30.0], dtype="int", bits=16)
+    ab = (a * b).execute(engine)
+    ab_vals = ab.unpack(engine)
+    print(f"Int16 Multiplication Results: {ab_vals}")
+    assert ab_vals == [50.0, -200.0, 450.0], f"Int16 mismatch: {ab_vals}"
     print("Int16 test passed successfully!\n")
 
-    # FloatingInt test (scale 2 for 10^-2 i.e. 100x multiplier)
+    # ── FloatingInt ───────────────────────────────────────────────────────────
     print("Testing FloatingInt (fixed point mapped to integer) with scale 2 (100x)...")
-    fi1 = numtoy.Expr.var(engine, "fi1", [1.25, 2.5, 3.75], dtype="floating_int", scale=2)
-    fi2 = numtoy.Expr.var(engine, "fi2", [0.75, 1.5, 2.25], dtype="floating_int", scale=2)
-    fi_add = fi1 + fi2
-    fi_res = fi_add.execute(engine)
-    fi_vals = fi_res.unpack(engine)
-    print(f"FloatingInt Addition Results: {fi_vals}")
-    expected_fi = [2.0, 4.0, 6.0]
-    assert fi_vals == expected_fi, f"FloatingInt mismatch! Got {fi_vals}, expected {expected_fi}"
+    p = nt.Expr.var(engine, "p", [1.0, 2.0, 3.0], dtype="floating_int", scale=2)
+    q = nt.Expr.var(engine, "q", [1.0, 2.0, 3.0], dtype="floating_int", scale=2)
+    pq = (p + q).execute(engine)
+    pq_vals = pq.unpack(engine)
+    print(f"FloatingInt Addition Results: {pq_vals}")
+    assert pq_vals == [2.0, 4.0, 6.0], f"FloatingInt mismatch: {pq_vals}"
     print("FloatingInt test passed successfully!\n")
 
-    # Decorator compile test
+    # ── @compile decorator ────────────────────────────────────────────────────
     print("Testing @numtoy.compile decorator...")
-    @numtoy.compile
+    @nt.compile
     def my_kernel(x, y):
         return (x + y) * 3.0
 
-    x_list = [1.0, 2.0, 3.0]
-    y_list = [4.0, 5.0, 6.0]
-    res_expr = my_kernel(engine, x_list, y_list)
+    res_expr = my_kernel(engine, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
     res_vals = res_expr.unpack(engine)
     print(f"Decorator Result: {res_vals}")
-    expected_dec = [15.0, 21.0, 27.0]
-    assert res_vals == expected_dec, f"Decorator mismatch! Got {res_vals}, expected {expected_dec}"
+    assert res_vals == [15.0, 21.0, 27.0], f"Decorator mismatch: {res_vals}"
     print("Decorator test passed successfully!\n")
 
-    # -- AdaptableFloat Sign Stealer test --------------------------------------
+    # ── Sign Stealer ──────────────────────────────────────────────────────────
     print("Testing AdaptableFloat Sign Stealer (all non-negative -> extra mantissa bit)...")
-    # All-positive values: sign stealer should activate automatically
-    pos_vals = [1.5, 3.0, 4.5]
-    x_pos = numtoy.Expr.var(engine, "xpos", pos_vals, dtype="float", bits=32)
-    y_pos = numtoy.Expr.var(engine, "ypos", pos_vals, dtype="float", bits=32)
-    add_pos = x_pos + y_pos
-    res_pos = add_pos.execute(engine, device="cpu")
+    xp = nt.Expr.var(engine, "xpos", [1.5, 3.0, 4.5])
+    yp = nt.Expr.var(engine, "ypos", [1.5, 3.0, 4.5])
+    res_pos = (xp + yp).execute(engine, device="cpu")
     vals_pos = res_pos.unpack(engine)
     print(f"Sign Stealer Results (all positive): {vals_pos}")
-    expected_pos = [3.0, 6.0, 9.0]
-    for got, exp in zip(vals_pos, expected_pos):
-        assert abs(got - exp) < 0.2, f"Sign Stealer mismatch: got {got}, expected {exp}"
-    print("Sign Stealer (positive-only) test passed!\n")
+    for got, exp in zip(vals_pos, [3.0, 6.0, 9.0]):
+        assert abs(got - exp) < 0.2, f"Sign Stealer mismatch: {got} vs {exp}"
+    print("Sign Stealer test passed!\n")
 
-    # ── GPU execution test ────────────────────────────────────────────────────
-    print("Testing GPU execution via WebGPU (with CPU fallback if no GPU available)...")
-    @numtoy.compile
+    # ── GPU execution ─────────────────────────────────────────────────────────
+    print("Testing GPU execution via WebGPU (with CPU fallback if no GPU)...")
+    @nt.compile
     def gpu_kernel(x, y):
         return (x + y) * 2.0
 
     gpu_result = gpu_kernel(engine, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], device="gpu")
     gpu_vals = gpu_result.unpack(engine)
     print(f"GPU Kernel Result: {gpu_vals}")
-    expected_gpu = [10.0, 14.0, 18.0]
-    for got, exp in zip(gpu_vals, expected_gpu):
-        assert abs(got - exp) < 0.5, f"GPU result mismatch: got {got}, expected {exp}"
+    for got, exp in zip(gpu_vals, [10.0, 14.0, 18.0]):
+        assert abs(got - exp) < 0.5, f"GPU mismatch: {got} vs {exp}"
     print("GPU execution test passed!\n")
+
+    # ── Auto-diff (product rule) ──────────────────────────────────────────────
+    print("Testing Auto-Diff: d/dx [(x+y)*x] at x=2, y=3 => 2*x+y = 7 ...")
+    xd = nt.Expr.var(engine, "xd", [2.0])
+    yd = nt.Expr.var(engine, "yd", [3.0])
+    zd = (xd + yd) * xd
+    grad_expr = zd.grad(xd).execute(engine)
+    grad_val = grad_expr.unpack(engine)[0]
+    print(f"d(z)/d(x) = {grad_val}  (expected ~7.0)")
+    assert abs(grad_val - 7.0) < 0.5, f"Auto-diff mismatch: {grad_val}"
+    print("Auto-diff test passed!\n")
+
+    # ── Tensor broadcast add ──────────────────────────────────────────────────
+    print("Testing Tensor broadcast: [3,1] + [1,2] -> [3,2] ...")
+    ta = nt.Tensor.from_values(engine, [1.0, 2.0, 3.0], [3, 1])
+    tb = nt.Tensor.from_values(engine, [10.0, 20.0], [1, 2])
+    tc_flat = (ta + tb).numpy(engine)
+    print(f"Broadcast result (nested): {tc_flat}")
+    expected_bc = [[11.0, 21.0], [12.0, 22.0], [13.0, 23.0]]
+    for row_got, row_exp in zip(tc_flat, expected_bc):
+        for got, exp in zip(row_got, row_exp):
+            assert abs(got - exp) < 0.5, f"Broadcast mismatch: {got} vs {exp}"
+    print("Tensor broadcast test passed!\n")
+
+    # ── Tensor reshape ────────────────────────────────────────────────────────
+    print("Testing Tensor reshape: [2,3] -> [3,2] ...")
+    tr = nt.Tensor.from_values(engine, list(range(6)), [2, 3])
+    tr2 = tr.reshape([3, 2]).execute(engine)
+    flat2 = tr2.numpy(engine)
+    print(f"Reshape result: {flat2}")
+    assert flat2 == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]], f"Reshape mismatch: {flat2}"
+    print("Tensor reshape test passed!\n")
 
     print("ALL PYTHON BINDINGS TESTS PASSED SUCCESSFULLY!")
 

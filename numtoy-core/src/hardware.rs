@@ -22,6 +22,13 @@ extern "C" {
         count: usize,
         bit_width: u32,
     ) -> *mut u64;
+    pub fn nt_tile(
+        engine: *mut EngineOpaque,
+        src: *const u8,
+        src_byte_len: usize,
+        repeat: usize,
+        out_len: *mut usize,
+    ) -> *mut u8;
 }
 
 pub struct HardwareEngine {
@@ -73,6 +80,31 @@ impl HardwareEngine {
             return vec![0; count];
         }
         let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
+        slice.to_vec()
+    }
+    /// Repeat a packed byte buffer `repeat` times (broadcast tiling).
+    pub fn tile(&self, src: &[u8], repeat: usize) -> Vec<u8> {
+        if src.is_empty() || repeat == 0 {
+            return Vec::new();
+        }
+        if repeat == 1 {
+            return src.to_vec();
+        }
+        let mut out_len = 0usize;
+        let ptr = unsafe {
+            nt_tile(
+                self.ptr,
+                src.as_ptr(),
+                src.len(),
+                repeat,
+                &mut out_len as *mut usize,
+            )
+        };
+        if ptr.is_null() {
+            // Fallback: pure Rust repeat
+            return src.repeat(repeat);
+        }
+        let slice = unsafe { std::slice::from_raw_parts(ptr, out_len) };
         slice.to_vec()
     }
 }

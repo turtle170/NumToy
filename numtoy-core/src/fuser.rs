@@ -18,7 +18,9 @@ pub enum FusedOp {
     Input(usize),
     ConstVal(f64),
     Add(Box<FusedOp>, Box<FusedOp>),
+    Sub(Box<FusedOp>, Box<FusedOp>),
     Mul(Box<FusedOp>, Box<FusedOp>),
+    Div(Box<FusedOp>, Box<FusedOp>),
 }
 
 pub struct MicroKernel {
@@ -45,18 +47,26 @@ impl MicroKernel {
                     });
                     FusedOp::Input(idx)
                 }
-                Expr::Constant { val } => {
-                    FusedOp::ConstVal(val.to_double())
-                }
+                Expr::Constant { val } => FusedOp::ConstVal(val.to_double()),
                 Expr::Add { left, right } => {
                     let l = traverse(left, inputs, var_map);
                     let r = traverse(right, inputs, var_map);
                     FusedOp::Add(Box::new(l), Box::new(r))
                 }
+                Expr::Sub { left, right } => {
+                    let l = traverse(left, inputs, var_map);
+                    let r = traverse(right, inputs, var_map);
+                    FusedOp::Sub(Box::new(l), Box::new(r))
+                }
                 Expr::Mul { left, right } => {
                     let l = traverse(left, inputs, var_map);
                     let r = traverse(right, inputs, var_map);
                     FusedOp::Mul(Box::new(l), Box::new(r))
+                }
+                Expr::Div { left, right } => {
+                    let l = traverse(left, inputs, var_map);
+                    let r = traverse(right, inputs, var_map);
+                    FusedOp::Div(Box::new(l), Box::new(r))
                 }
             }
         }
@@ -150,10 +160,20 @@ pub fn compile_kernel(kernel: &MicroKernel) -> Option<extern "C" fn(*const *cons
                 let r = compile_op(builder, right, inputs_arg, i_val, ptr_type);
                 builder.ins().fadd(l, r)
             }
+            FusedOp::Sub(left, right) => {
+                let l = compile_op(builder, left, inputs_arg, i_val, ptr_type);
+                let r = compile_op(builder, right, inputs_arg, i_val, ptr_type);
+                builder.ins().fsub(l, r)
+            }
             FusedOp::Mul(left, right) => {
                 let l = compile_op(builder, left, inputs_arg, i_val, ptr_type);
                 let r = compile_op(builder, right, inputs_arg, i_val, ptr_type);
                 builder.ins().fmul(l, r)
+            }
+            FusedOp::Div(left, right) => {
+                let l = compile_op(builder, left, inputs_arg, i_val, ptr_type);
+                let r = compile_op(builder, right, inputs_arg, i_val, ptr_type);
+                builder.ins().fdiv(l, r)
             }
         }
     }
@@ -199,15 +219,12 @@ fn wgsl_expr(op: &FusedOp) -> String {
     match op {
         FusedOp::Input(idx) => format!("inputs{}[idx]", idx),
         FusedOp::ConstVal(v) => {
-            // WGSL requires the decimal point for float literals
-            if v.fract() == 0.0 {
-                format!("{:.1}", v)
-            } else {
-                format!("{}", v)
-            }
+            if v.fract() == 0.0 { format!("{:.1}", v) } else { format!("{}", v) }
         }
         FusedOp::Add(l, r) => format!("({} + {})", wgsl_expr(l), wgsl_expr(r)),
+        FusedOp::Sub(l, r) => format!("({} - {})", wgsl_expr(l), wgsl_expr(r)),
         FusedOp::Mul(l, r) => format!("({} * {})", wgsl_expr(l), wgsl_expr(r)),
+        FusedOp::Div(l, r) => format!("({} / {})", wgsl_expr(l), wgsl_expr(r)),
     }
 }
 
