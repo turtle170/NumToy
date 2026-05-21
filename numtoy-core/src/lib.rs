@@ -3,12 +3,15 @@ pub mod hardware;
 pub mod ir;
 pub mod fuser;
 pub mod tensor;
+pub mod graph;
+pub mod cache;
+pub mod pool;
 
 use pyo3::prelude::*;
 use crate::types::{DataType, Scalar};
 use crate::hardware::HardwareEngine;
 use crate::ir::Expr;
-use crate::fuser::execute_expr_on_device;
+use crate::tensor::execute_expr_on_device;
 use crate::tensor::Tensor;
 use std::sync::Arc;
 
@@ -524,7 +527,7 @@ pub unsafe extern "C" fn nt_tensor_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuser::execute_expr_on_device;
+    use crate::tensor::execute_expr_on_device;
 
     fn make_var(engine: &HardwareEngine, id: usize, values: &[f64]) -> Expr {
         let steal = values.iter().all(|&v| v >= 0.0);

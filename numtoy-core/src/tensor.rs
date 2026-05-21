@@ -7,7 +7,6 @@
 use crate::ir::Expr;
 use crate::types::{DataType, Scalar};
 use crate::hardware::HardwareEngine;
-use crate::fuser::execute_expr_on_device;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static BROADCAST_ID_CTR: AtomicUsize = AtomicUsize::new(10_000);
@@ -172,11 +171,11 @@ impl Tensor {
 
     // ─── Execution ─────────────────────────────────────────────────────────
 
-    /// JIT-compile and execute the backing expression graph.
-    pub fn execute(&self, engine: &HardwareEngine, device: &str) -> Tensor {
-        let result_expr = execute_expr_on_device(engine, &self.expr, device);
+    pub fn execute(&self, engine: &HardwareEngine, _device: &str) -> Tensor {
+        let result_expr = execute_expr_on_device(engine, &self.expr, _device);
         Tensor::from_expr(result_expr, self.shape.clone())
     }
+
 
     // ─── Unpack to flat f64 vector ─────────────────────────────────────────
 
@@ -263,4 +262,59 @@ pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Vec<usize> {
         };
     }
     out
+}
+
+
+pub fn execute_expr_on_device(_engine: &crate::hardware::HardwareEngine, expr: &crate::ir::Expr, _device: &str) -> crate::ir::Expr {
+    // Generate the arena graph
+    let graph = crate::graph::ArenaGraph::from_expr(expr);
+    let target_dtype = expr.data_type();
+    let target_scale = expr.get_scale();
+    let target_steal = expr.steal_sign();
+    
+    let kernel = crate::fuser::MicroKernel::generate(expr);
+    let out_bits = match target_dtype {
+        crate::types::DataType::Float(bits) | crate::types::DataType::Int(bits) => bits,
+        crate::types::DataType::DynamicFloat | crate::types::DataType::FloatingInt => 64,
+        crate::types::DataType::ScalableInt(bits) | crate::types::DataType::ScalableFloat(bits, _) => bits,
+    };
+    
+    let out_bytes = if out_bits % 8 == 0 {
+        kernel.size * (out_bits as usize / 8)
+    } else {
+        (kernel.size * out_bits as usize + 7) / 8
+    };
+    let mut output_buf = vec![0u8; out_bytes];
+    
+    // Submit to thread pool
+    let hash = crate::pool::GLOBAL_POOL.submit(graph);
+    
+    // Block until compiled
+    let run_fn = loop {
+        if let Some(f) = crate::cache::JIT_CACHE.get(&hash) {
+            break *f;
+        }
+        std::thread::yield_now();
+    };
+    
+    let input_ptrs: Vec<*const u8> = kernel.inputs.iter().map(|input_var| {
+        match input_var {
+            crate::ir::Expr::Variable { packed_data, .. } => packed_data.as_ptr(),
+            _ => unreachable!(),
+        }
+    }).collect();
+    
+    unsafe {
+        run_fn(input_ptrs.as_ptr(), output_buf.as_mut_ptr(), kernel.size);
+    }
+    
+    crate::ir::Expr::new_var(
+        999,
+        "fused_pool_result",
+        target_dtype,
+        kernel.size,
+        output_buf,
+        target_scale,
+        target_steal,
+    )
 }
