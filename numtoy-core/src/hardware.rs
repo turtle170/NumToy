@@ -77,9 +77,11 @@ impl HardwareEngine {
             )
         };
         if ptr.is_null() {
-            return vec![0; count];
+            let k = ((bit_width + 63) / 64) as usize;
+            return vec![0; count * k];
         }
-        let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
+        let k = ((bit_width + 63) / 64) as usize;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, count * k) };
         slice.to_vec()
     }
     /// Repeat a packed byte buffer `repeat` times (broadcast tiling).

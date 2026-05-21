@@ -17,7 +17,7 @@ use std::sync::Arc;
 // ─────────────────────────────────────────────────────────
 fn should_steal_sign(dtype: DataType, values: &[f64]) -> bool {
     match dtype {
-        DataType::Float(_) | DataType::DynamicFloat => values.iter().all(|&v| v >= 0.0),
+        DataType::Float(_) | DataType::DynamicFloat | DataType::ScalableFloat(_, _) => values.iter().all(|&v| v >= 0.0),
         _ => false,
     }
 }
@@ -66,6 +66,31 @@ impl PyExpr {
             "int"          => DataType::Int(bits),
             "dynamic_float"=> DataType::DynamicFloat,
             "floating_int" => DataType::FloatingInt,
+            "scalable_int" => {
+                let max_bits = values.iter()
+                    .map(|&v| crate::types::compute_scalable_int_bits(v.round() as i64))
+                    .max()
+                    .unwrap_or(2);
+                DataType::ScalableInt(max_bits)
+            }
+            "scalable_float" => {
+                let steal_sign = values.iter().all(|&v| v >= 0.0);
+                let mut max_b = 8;
+                let mut max_e = 4;
+                for &v in &values {
+                    let (b, e) = crate::types::compute_scalable_float_config(v, steal_sign);
+                    if b > max_b { max_b = b; }
+                    if e > max_e { max_e = e; }
+                }
+                let sign_bit = if steal_sign { 0 } else { 1 };
+                if max_b < max_e + sign_bit + 1 {
+                    max_b = max_e + sign_bit + 1;
+                }
+                if max_b > 64 {
+                    max_b = 64;
+                }
+                DataType::ScalableFloat(max_b, max_e)
+            }
             _              => panic!("Unknown datatype: {}", dtype_str),
         };
 
@@ -80,13 +105,16 @@ impl PyExpr {
             DataType::Int(b)    => Scalar::Int(v.round() as i64, b),
             DataType::DynamicFloat => Scalar::DynamicFloat(v),
             DataType::FloatingInt  => crate::types::double_to_floating_int(v, scale.unwrap_or(1)),
+            DataType::ScalableInt(b) => Scalar::ScalableInt(v.round() as i64, b),
+            DataType::ScalableFloat(b, e) => Scalar::ScalableFloat(v, b, e),
         }).collect();
 
-        let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal_sign)).collect();
+        let u64s: Vec<u64> = scalars.iter().flat_map(|s| s.to_limbs(steal_sign)).collect();
         let bit_width = match dtype {
             DataType::Float(b)  => b,
             DataType::Int(b)    => b,
             DataType::DynamicFloat | DataType::FloatingInt => 64,
+            DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => b,
         };
         let packed = engine.inner.pack(&u64s, bit_width);
 
@@ -132,10 +160,13 @@ impl PyExpr {
                     DataType::Float(b) => *b,
                     DataType::Int(b)   => *b,
                     DataType::DynamicFloat | DataType::FloatingInt => 64,
+                    DataType::ScalableInt(b) => *b,
+                    DataType::ScalableFloat(b, _) => *b,
                 };
                 let raw = engine.inner.unpack(packed_data, *size, bit_width);
-                raw.into_iter()
-                    .map(|u| Scalar::from_u64_packed(u, *dtype, *scale, *steal_sign).to_double())
+                let k = ((bit_width + 63) / 64) as usize;
+                raw.chunks_exact(k)
+                    .map(|limbs| Scalar::from_limbs(limbs, *dtype, *scale, *steal_sign).to_double())
                     .collect()
             }
             _ => panic!("Cannot unpack non-variable expression; call execute() first"),
@@ -171,6 +202,31 @@ impl PyTensor {
             "int"           => DataType::Int(bits),
             "dynamic_float" => DataType::DynamicFloat,
             "floating_int"  => DataType::FloatingInt,
+            "scalable_int" => {
+                let max_bits = values.iter()
+                    .map(|&v| crate::types::compute_scalable_int_bits(v.round() as i64))
+                    .max()
+                    .unwrap_or(2);
+                DataType::ScalableInt(max_bits)
+            }
+            "scalable_float" => {
+                let steal_sign = values.iter().all(|&v| v >= 0.0);
+                let mut max_b = 8;
+                let mut max_e = 4;
+                for &v in &values {
+                    let (b, e) = crate::types::compute_scalable_float_config(v, steal_sign);
+                    if b > max_b { max_b = b; }
+                    if e > max_e { max_e = e; }
+                }
+                let sign_bit = if steal_sign { 0 } else { 1 };
+                if max_b < max_e + sign_bit + 1 {
+                    max_b = max_e + sign_bit + 1;
+                }
+                if max_b > 64 {
+                    max_b = 64;
+                }
+                DataType::ScalableFloat(max_b, max_e)
+            }
             _               => panic!("Unknown datatype: {}", dtype_str),
         };
 
@@ -180,11 +236,14 @@ impl PyTensor {
             DataType::Int(b)    => Scalar::Int(v.round() as i64, b),
             DataType::DynamicFloat => Scalar::DynamicFloat(v),
             DataType::FloatingInt  => crate::types::double_to_floating_int(v, scale.unwrap_or(1)),
+            DataType::ScalableInt(b) => Scalar::ScalableInt(v.round() as i64, b),
+            DataType::ScalableFloat(b, e) => Scalar::ScalableFloat(v, b, e),
         }).collect();
 
-        let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal_sign)).collect();
+        let u64s: Vec<u64> = scalars.iter().flat_map(|s| s.to_limbs(steal_sign)).collect();
         let bit_width = match dtype {
             DataType::Float(b) | DataType::Int(b) => b,
+            DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => b,
             _ => 64,
         };
         let packed = engine.inner.pack(&u64s, bit_width);
@@ -275,24 +334,52 @@ pub unsafe extern "C" fn nt_expr_new_var(
     let name_str = if name.is_null() { "var" }
     else { std::ffi::CStr::from_ptr(name).to_str().unwrap_or("var") };
 
+    let slice = std::slice::from_raw_parts(values, count);
     let dtype = match dtype_val {
         0 => DataType::Float(bits),
         1 => DataType::Int(bits),
         2 => DataType::DynamicFloat,
         3 => DataType::FloatingInt,
+        4 => {
+            let max_bits = slice.iter()
+                .map(|&v| crate::types::compute_scalable_int_bits(v.round() as i64))
+                .max()
+                .unwrap_or(2);
+            DataType::ScalableInt(max_bits)
+        }
+        5 => {
+            let steal_sign = slice.iter().all(|&v| v >= 0.0);
+            let mut max_b = 8;
+            let mut max_e = 4;
+            for &v in slice {
+                let (b, e) = crate::types::compute_scalable_float_config(v, steal_sign);
+                if b > max_b { max_b = b; }
+                if e > max_e { max_e = e; }
+            }
+            let sign_bit = if steal_sign { 0 } else { 1 };
+            if max_b < max_e + sign_bit + 1 {
+                max_b = max_e + sign_bit + 1;
+            }
+            if max_b > 64 {
+                max_b = 64;
+            }
+            DataType::ScalableFloat(max_b, max_e)
+        }
         _ => DataType::DynamicFloat,
     };
-    let slice = std::slice::from_raw_parts(values, count);
     let steal_sign = should_steal_sign(dtype, slice);
     let scalars: Vec<Scalar> = slice.iter().map(|&v| match dtype {
         DataType::Float(b)  => Scalar::Float(v, b),
         DataType::Int(b)    => Scalar::Int(v.round() as i64, b),
         DataType::DynamicFloat => Scalar::DynamicFloat(v),
         DataType::FloatingInt  => crate::types::double_to_floating_int(v, scale),
+        DataType::ScalableInt(b) => Scalar::ScalableInt(v.round() as i64, b),
+        DataType::ScalableFloat(b, e) => Scalar::ScalableFloat(v, b, e),
     }).collect();
-    let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal_sign)).collect();
+    let u64s: Vec<u64> = scalars.iter().flat_map(|s| s.to_limbs(steal_sign)).collect();
     let bit_width = match dtype {
         DataType::Float(b) | DataType::Int(b) => b,
+        DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => b,
         _ => 64,
     };
     let packed = engine_ref.pack(&u64s, bit_width);
@@ -360,13 +447,16 @@ pub unsafe extern "C" fn nt_expr_unpack(
         Expr::Variable { dtype, size, packed_data, scale, steal_sign, .. } => {
             let bit_width = match dtype {
                 DataType::Float(b) | DataType::Int(b) => *b,
+                DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => *b,
                 _ => 64,
             };
             let raw = (*engine).unpack(packed_data, *size, bit_width);
             let count = std::cmp::min(*size, max_count);
+            let k = ((bit_width + 63) / 64) as usize;
             for i in 0..count {
+                let chunk = &raw[i * k .. (i + 1) * k];
                 *out_values.add(i) =
-                    Scalar::from_u64_packed(raw[i], *dtype, *scale, *steal_sign).to_double();
+                    Scalar::from_limbs(chunk, *dtype, *scale, *steal_sign).to_double();
             }
             count
         }
@@ -439,7 +529,7 @@ mod tests {
     fn make_var(engine: &HardwareEngine, id: usize, values: &[f64]) -> Expr {
         let steal = values.iter().all(|&v| v >= 0.0);
         let scalars: Vec<Scalar> = values.iter().map(|&v| Scalar::Float(v, 32)).collect();
-        let u64s: Vec<u64> = scalars.iter().map(|s| s.to_u64_packed(steal)).collect();
+        let u64s: Vec<u64> = scalars.iter().flat_map(|s| s.to_limbs(steal)).collect();
         let packed = engine.pack(&u64s, 32);
         Expr::new_var(id, &format!("v{id}"), DataType::Float(32), values.len(), packed, None, steal)
     }

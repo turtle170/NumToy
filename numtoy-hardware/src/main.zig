@@ -112,19 +112,26 @@ pub fn pack_bits(allocator: std.mem.Allocator, src: []const u64, bit_width: u32)
     }
 
     // ── Scalar fallback for custom bit widths ─────────────
-    const total_bits = src.len * bit_width;
+    const K = (bit_width + 63) / 64;
+    const count = src.len / K;
+    const total_bits = count * bit_width;
     const total_bytes = (total_bits + 7) / 8;
     const dest = try allocator.alloc(u8, total_bytes);
     @memset(dest, 0);
 
-    for (src, 0..) |val, i| {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
         const start_bit = i * bit_width;
-        var bit_idx: u64 = 0;
+        var bit_idx: u32 = 0;
         while (bit_idx < bit_width) : (bit_idx += 1) {
+            const limb_idx = bit_idx / 64;
+            const bit_in_limb = @as(u6, @intCast(bit_idx % 64));
             const current_bit = start_bit + bit_idx;
             const byte_idx = current_bit / 8;
             const bit_in_byte = @as(u3, @intCast(current_bit % 8));
-            const bit_val = @as(u8, @intCast((val >> @intCast(bit_idx)) & 1));
+            
+            const val_limb = src[i * K + limb_idx];
+            const bit_val = @as(u8, @intCast((val_limb >> bit_in_limb) & 1));
             dest[byte_idx] |= (bit_val << bit_in_byte);
         }
     }
@@ -133,24 +140,27 @@ pub fn pack_bits(allocator: std.mem.Allocator, src: []const u64, bit_width: u32)
 
 /// Unpack a densely-packed byte buffer into u64 values.  Mirror of `pack_bits`.
 pub fn unpack_bits(allocator: std.mem.Allocator, src: []const u8, count: usize, bit_width: u32) ![]u64 {
-    const dest = try allocator.alloc(u64, count);
     if (bit_width == 0) {
+        const dest = try allocator.alloc(u64, count);
         @memset(dest, 0);
         return dest;
     }
 
     switch (bit_width) {
         8 => {
+            const dest = try allocator.alloc(u64, count);
             for (0..count) |i| dest[i] = @as(u64, src[i]);
             return dest;
         },
         16 => {
+            const dest = try allocator.alloc(u64, count);
             for (0..count) |i| {
                 dest[i] = @as(u64, src[i * 2]) | (@as(u64, src[i * 2 + 1]) << 8);
             }
             return dest;
         },
         32 => {
+            const dest = try allocator.alloc(u64, count);
             for (0..count) |i| {
                 dest[i] = @as(u64, src[i * 4])
                     | (@as(u64, src[i * 4 + 1]) << 8)
@@ -160,6 +170,7 @@ pub fn unpack_bits(allocator: std.mem.Allocator, src: []const u8, count: usize, 
             return dest;
         },
         64 => {
+            const dest = try allocator.alloc(u64, count);
             for (0..count) |i| {
                 dest[i] = @as(u64, src[i * 8])
                     | (@as(u64, src[i * 8 + 1]) << 8)
@@ -176,20 +187,25 @@ pub fn unpack_bits(allocator: std.mem.Allocator, src: []const u8, count: usize, 
     }
 
     // Scalar fallback
-    for (0..count) |i| {
+    const K = (bit_width + 63) / 64;
+    const dest = try allocator.alloc(u64, count * K);
+    @memset(dest, 0);
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
         const start_bit = i * bit_width;
-        var val: u64 = 0;
-        var bit_idx: u64 = 0;
+        var bit_idx: u32 = 0;
         while (bit_idx < bit_width) : (bit_idx += 1) {
+            const limb_idx = bit_idx / 64;
+            const bit_in_limb = @as(u6, @intCast(bit_idx % 64));
             const current_bit = start_bit + bit_idx;
             const byte_idx = current_bit / 8;
             const bit_in_byte = @as(u3, @intCast(current_bit % 8));
             if (byte_idx < src.len) {
                 const bit_val = (src[byte_idx] >> bit_in_byte) & 1;
-                val |= (@as(u64, bit_val) << @intCast(bit_idx));
+                dest[i * K + limb_idx] |= (@as(u64, bit_val) << bit_in_limb);
             }
         }
-        dest[i] = val;
     }
     return dest;
 }
@@ -310,4 +326,23 @@ test "nt_tile broadcast copy" {
     const unpacked = try unpack_bits(allocator, tiled, 3, 8);
     defer allocator.free(unpacked);
     for (0..3) |j| try std.testing.expectEqual(@as(u64, 7), unpacked[j]);
+}
+
+test "large bit-width packing round-trip" {
+    const allocator = std.testing.allocator;
+    // 128-bit values (2 limbs per value)
+    const src = [_]u64{ 0x1111222233334444, 0x5555666677778888, 0x9999AAAABBBBCCCC, 0xDDDDEEEEFFFF0000 };
+    const bit_width = 128;
+    const packed_bytes = try pack_bits(allocator, &src, bit_width);
+    defer allocator.free(packed_bytes);
+    
+    // 4 limbs * 8 bytes = 32 bytes
+    try std.testing.expectEqual(@as(usize, 32), packed_bytes.len);
+    
+    const unpacked = try unpack_bits(allocator, packed_bytes, 2, bit_width);
+    defer allocator.free(unpacked);
+    
+    for (src, 0..) |v, idx| {
+        try std.testing.expectEqual(v, unpacked[idx]);
+    }
 }

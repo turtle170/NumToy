@@ -115,21 +115,24 @@ impl Tensor {
         let dtype = self.expr.data_type();
         let scale = self.expr.get_scale();
         let steal = out.iter().all(|&v| v >= 0.0)
-            && matches!(dtype, crate::types::DataType::Float(_) | crate::types::DataType::DynamicFloat);
+            && matches!(dtype, crate::types::DataType::Float(_) | crate::types::DataType::DynamicFloat | crate::types::DataType::ScalableFloat(_, _));
 
-        let u64s: Vec<u64> = out.iter().map(|&f| {
+        let u64s: Vec<u64> = out.iter().flat_map(|&f| {
             let scalar = match dtype {
                 crate::types::DataType::Float(b) => Scalar::Float(f, b),
                 crate::types::DataType::Int(b) => Scalar::Int(f.round() as i64, b),
                 crate::types::DataType::DynamicFloat => Scalar::DynamicFloat(f),
                 crate::types::DataType::FloatingInt =>
                     crate::types::double_to_floating_int(f, scale.unwrap_or(1)),
+                crate::types::DataType::ScalableInt(b) => Scalar::ScalableInt(f.round() as i64, b),
+                crate::types::DataType::ScalableFloat(b, e) => Scalar::ScalableFloat(f, b, e),
             };
-            scalar.to_u64_packed(steal)
+            scalar.to_limbs(steal)
         }).collect();
 
         let bit_width = match dtype {
             crate::types::DataType::Float(b) | crate::types::DataType::Int(b) => b,
+            crate::types::DataType::ScalableInt(b) | crate::types::DataType::ScalableFloat(b, _) => b,
             _ => 64,
         };
         let packed = engine.pack(&u64s, bit_width);
@@ -185,10 +188,13 @@ impl Tensor {
                     DataType::Int(b) => *b,
                     DataType::DynamicFloat => 64,
                     DataType::FloatingInt => 64,
+                    DataType::ScalableInt(b) => *b,
+                    DataType::ScalableFloat(b, _) => *b,
                 };
                 let raw = engine.unpack(packed_data, *size, bit_width);
-                raw.into_iter()
-                    .map(|u| Scalar::from_u64_packed(u, *dtype, *scale, *steal_sign).to_double())
+                let k = ((bit_width + 63) / 64) as usize;
+                raw.chunks_exact(k)
+                    .map(|limbs| Scalar::from_limbs(limbs, *dtype, *scale, *steal_sign).to_double())
                     .collect()
             }
             _ => panic!("Tensor::to_flat_f64 – call execute() first"),

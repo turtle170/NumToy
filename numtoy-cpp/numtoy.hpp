@@ -14,7 +14,9 @@ enum class DataType : uint32_t {
     Float = 0,
     Int = 1,
     DynamicFloat = 2,
-    FloatingInt = 3
+    FloatingInt = 3,
+    ScalableInt = 4,
+    ScalableFloat = 5
 };
 
 class Engine {
