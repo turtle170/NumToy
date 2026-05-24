@@ -28,6 +28,7 @@ numtoy-cpp/*.pdb
 # Windows artifacts
 Thumbs.db
 Desktop.ini
+*.pdb
 
 # antigravity internal
 .antigravitycli/

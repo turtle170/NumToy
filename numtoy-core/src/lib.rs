@@ -9,6 +9,8 @@ pub mod pool;
 pub mod gpu;
 pub mod calculator;
 pub mod jit;
+pub mod signals;
+pub mod network;
 
 use pyo3::prelude::*;
 use crate::types::{DataType, Scalar};
@@ -529,6 +531,7 @@ impl PyTensor {
 
 #[pymodule]
 fn numtoy_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    signals::install();
     m.add_class::<PyEngine>()?;
     m.add_class::<PyExpr>()?;
     m.add_class::<PyTensor>()?;

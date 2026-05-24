@@ -7,6 +7,10 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
 };
 
+/// Global pointer to the active engine for signal cleanup.
+/// Set by nt_engine_create, cleared by nt_engine_destroy.
+var g_active_engine: ?*Engine = null;
+
 pub export fn nt_engine_create() ?*Engine {
     const arena_ptr = std.heap.page_allocator.create(std.heap.ArenaAllocator) catch return null;
     arena_ptr.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -21,14 +25,26 @@ pub export fn nt_engine_create() ?*Engine {
         .arena = arena_ptr,
         .allocator = allocator,
     };
+    g_active_engine = engine;
     return engine;
 }
 
 pub export fn nt_engine_destroy(engine: ?*Engine) void {
+    g_active_engine = null;
     if (engine) |e| {
         const arena_ptr = e.arena;
         arena_ptr.deinit();
         std.heap.page_allocator.destroy(arena_ptr);
+    }
+}
+
+/// Called by the Rust signal handler to free any active Zig arenas before
+/// the process terminates.  Safe to call from an async-signal context because
+/// it only touches the arena (no locking, no allocations).
+pub export fn nt_emergency_free() void {
+    if (g_active_engine) |e| {
+        e.arena.deinit();
+        g_active_engine = null;
     }
 }
 

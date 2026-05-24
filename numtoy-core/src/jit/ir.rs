@@ -6,6 +6,7 @@
 
 use crate::graph::{ArenaGraph, Node, NodeId};
 use crate::types::DataType;
+use super::bounds::{check_program, BoundsReport};
 
 // ─── Core SSA types ──────────────────────────────────────────────────────────
 
@@ -46,7 +47,7 @@ pub struct LiveInterval {
     pub end: usize,   // index of last instruction that reads this vreg
 }
 
-/// Complete lowered program ready for x86-64 emission.
+/// Complete lowered program ready for native code emission.
 pub struct NtProgram {
     pub insts: Vec<Inst>,
     pub num_vregs: usize,
@@ -56,10 +57,12 @@ pub struct NtProgram {
     pub output_vreg: VReg,
     /// Element width in bits (32 or 64).
     pub bits: u32,
-    /// `alloc[vreg]` → physical XMM register assigned to that VReg.
+    /// `alloc[vreg]` → physical XMM/NEON register assigned to that VReg.
     pub alloc: Vec<PReg>,
     /// Live intervals (sorted by start) — kept for diagnostics / future passes.
     pub intervals: Vec<LiveInterval>,
+    /// Static analysis report: NaN-boxing, overflow sites, guard-zone status.
+    pub bounds: BoundsReport,
 }
 
 // ─── Lowering: ArenaGraph → NtProgram ────────────────────────────────────────
@@ -113,7 +116,7 @@ pub fn try_lower(graph: &ArenaGraph) -> Option<NtProgram> {
     // ── Register allocation (linear scan) ───────────────────────────────────
     let alloc = linear_scan_alloc(&intervals, num_vregs)?;
 
-    Some(NtProgram {
+    let mut prog = NtProgram {
         insts,
         num_vregs,
         num_inputs,
@@ -121,7 +124,21 @@ pub fn try_lower(graph: &ArenaGraph) -> Option<NtProgram> {
         bits,
         alloc,
         intervals,
-    })
+        bounds: BoundsReport::default(),
+    };
+
+    // ── Bound-checking assertions ────────────────────────────────────────────
+    // Run the static analyser BEFORE handing the program to the emitter.
+    // A structurally invalid program is rejected here rather than producing
+    // corrupt machine code.
+    let report = check_program(&prog);
+    if !report.structurally_valid {
+        // Structural violation — do not emit. Fall back to Cranelift.
+        return None;
+    }
+    prog.bounds = report;
+
+    Some(prog)
 }
 
 // ─── Lowering context ────────────────────────────────────────────────────────
