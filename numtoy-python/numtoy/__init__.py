@@ -1,5 +1,17 @@
-from .numtoy_core import PyEngine, PyExpr, PyTensor
+from .numtoy_core import PyEngine, PyExpr, NumToyArray as PyTensor, set_execution_mode_py
 import random as _random
+import contextlib
+
+@contextlib.contextmanager
+def mode(mode_name: str):
+    """Context manager to set execution mode ('default', 'eager', 'hyper')."""
+    # Assuming there's no nested mode tracking needed for this simple implementation
+    # A complete solution would save the previous mode. We just reset to default for now.
+    try:
+        set_execution_mode_py(mode_name.lower())
+        yield
+    finally:
+        set_execution_mode_py("default")
 
 class Engine:
     """
@@ -136,6 +148,29 @@ class Tensor:
         t._id = id_
         return t
 
+    @staticmethod
+    def from_mmap(filepath: str, count: int, shape: list,
+                  dtype: str = "float", bits: int = 32,
+                  name: str = "t", scale: int = 0) -> 'Tensor':
+        """Create a Tensor mapped directly from a file without loading into memory."""
+        numel = 1
+        for d in shape: numel *= d
+        assert count >= numel, f"from_mmap: count={count} < numel={numel}"
+        id_ = _random.randint(1, 1_000_000)
+        inner = PyTensor.from_mmap(
+            id_, name, filepath, count, list(shape), dtype, bits, scale if scale else None
+        )
+        t = Tensor(inner)
+        t._id = id_
+        return t
+
+    @staticmethod
+    def dequantize_matmul(activations: 'Tensor', weights: 'Tensor') -> 'Tensor':
+        """Specialized quantized matrix multiplication using the CPU micro-kernel."""
+        if not isinstance(activations, Tensor) or not isinstance(weights, Tensor):
+            raise TypeError("dequantize_matmul requires Tensor operands")
+        return Tensor(PyTensor.dequantize_matmul(activations._t, weights._t))
+
     # ── Properties ────────────────────────────────────────
     @property
     def shape(self) -> list:
@@ -146,6 +181,16 @@ class Tensor:
 
     def broadcast_to(self, engine: Engine, target_shape: list) -> 'Tensor':
         return Tensor(self._t.broadcast_to(engine.inner, list(target_shape)))
+
+    @property
+    def __array_interface__(self):
+        return self._t.__array_interface__
+
+    def transpose(self) -> 'Tensor':
+        return Tensor(self._t.transpose())
+
+    def slice_and_dice(self, ranges: list) -> 'Tensor':
+        return Tensor(self._t.slice_and_dice(ranges))
 
     # ── Arithmetic ────────────────────────────────────────
     def __add__(self, other: 'Tensor') -> 'Tensor':

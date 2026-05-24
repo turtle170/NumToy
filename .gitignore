@@ -22,8 +22,6 @@ numtoy-cpp/numtoy_core.dll
 numtoy-cpp/*.pdb
 
 # IDE files
-.vscode/
-.idea/
 *.suo
 *.user
 
@@ -33,3 +31,4 @@ Desktop.ini
 
 # antigravity internal
 .antigravitycli/
+.claude/

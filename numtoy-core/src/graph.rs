@@ -10,7 +10,10 @@ pub enum Node {
         name: String,
         dtype: DataType,
         size: usize,
-        packed_data: Vec<u8>,
+        packed_data: crate::ir::PackedBuffer,
+        shape: Vec<usize>,
+        bit_strides: Vec<usize>,
+        bit_offset: usize,
         scale: Option<u32>,
         steal_sign: bool,
     },
@@ -21,6 +24,7 @@ pub enum Node {
     Sub(NodeId, NodeId),
     Mul(NodeId, NodeId),
     Div(NodeId, NodeId),
+    DequantizeMatmul(NodeId, NodeId, usize, usize, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -54,13 +58,16 @@ impl ArenaGraph {
 
     fn traverse(expr: &Expr, graph: &mut ArenaGraph) -> NodeId {
         match expr {
-            Expr::Variable { id, name, dtype, size, packed_data, scale, steal_sign } => {
+            Expr::Variable { id, name, dtype, size, packed_data, scale, steal_sign, shape, bit_strides, bit_offset } => {
                 graph.push(Node::Variable {
                     id: *id,
                     name: name.clone(),
                     dtype: *dtype,
                     size: *size,
                     packed_data: packed_data.clone(),
+                    shape: shape.clone(),
+                    bit_strides: bit_strides.clone(),
+                    bit_offset: *bit_offset,
                     scale: *scale,
                     steal_sign: *steal_sign,
                 })
@@ -88,6 +95,11 @@ impl ArenaGraph {
                 let r = Self::traverse(right, graph);
                 graph.push(Node::Div(l, r))
             }
+            Expr::DequantizeMatmul { activations, weights, m, k, n } => {
+                let a = Self::traverse(activations, graph);
+                let w = Self::traverse(weights, graph);
+                graph.push(Node::DequantizeMatmul(a, w, *m, *k, *n))
+            }
         }
     }
 
@@ -96,6 +108,7 @@ impl ArenaGraph {
             Node::Variable { dtype, .. } => *dtype,
             Node::Constant { val } => val.data_type(),
             Node::Add(l, _) | Node::Sub(l, _) | Node::Mul(l, _) | Node::Div(l, _) => self.data_type(*l),
+            Node::DequantizeMatmul(_, _, _, _, _) => DataType::Float(32),
         }
     }
 
@@ -108,6 +121,7 @@ impl ArenaGraph {
                 let rs = self.size(*r);
                 if ls > rs { ls } else { rs }
             }
+            Node::DequantizeMatmul(a, ..) => self.size(*a),
         }
     }
 
@@ -121,6 +135,7 @@ impl ArenaGraph {
             Node::Add(l, r) | Node::Sub(l, r) | Node::Mul(l, r) | Node::Div(l, r) => {
                 self.get_scale(*l).or_else(|| self.get_scale(*r))
             }
+            Node::DequantizeMatmul(_, _, _, _, _) => None,
         }
     }
 
@@ -129,6 +144,12 @@ impl ArenaGraph {
             Node::Variable { steal_sign, .. } => *steal_sign,
             Node::Constant { .. } => false,
             Node::Add(l, _) | Node::Sub(l, _) | Node::Mul(l, _) | Node::Div(l, _) => self.steal_sign(*l),
+            Node::DequantizeMatmul(_, _, _, _, _) => false,
         }
+    }
+
+    pub fn get_expr(&self, id: NodeId) -> Option<&Expr> {
+        // ArenaGraph doesn't store original Exprs anymore
+        None
     }
 }

@@ -748,3 +748,12 @@ pub fn double_to_floating_int(val: f64, scale: u32) -> Scalar {
     let int_val = (val * multiplier).round() as i64;
     Scalar::FloatingInt { value: int_val, scale }
 }
+
+impl DataType {
+    pub fn bit_width(&self) -> u32 {
+        match self {
+            DataType::Float(b) | DataType::Int(b) | DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => *b,
+            DataType::DynamicFloat | DataType::FloatingInt => 64,
+        }
+    }
+}

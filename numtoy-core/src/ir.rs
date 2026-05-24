@@ -2,13 +2,31 @@ use crate::types::{DataType, Scalar};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
+pub enum PackedBuffer {
+    Memory(Arc<Vec<u8>>),
+    Mmap(Arc<memmap2::Mmap>),
+}
+
+impl PackedBuffer {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            PackedBuffer::Memory(v) => v.as_slice(),
+            PackedBuffer::Mmap(m) => m.as_ref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Expr {
     Variable {
         id: usize,
         name: String,
         dtype: DataType,
         size: usize,
-        packed_data: Vec<u8>,
+        packed_data: PackedBuffer,
+        shape: Vec<usize>,
+        bit_strides: Vec<usize>,
+        bit_offset: usize,
         scale: Option<u32>, // Specifically for FloatingInt scale tracking
         steal_sign: bool,   // AdaptableFloat Sign Stealer: all values are non-negative
     },
@@ -31,6 +49,13 @@ pub enum Expr {
         left: Arc<Expr>,
         right: Arc<Expr>,
     },
+    DequantizeMatmul {
+        activations: Arc<Expr>,
+        weights: Arc<Expr>,
+        m: usize,
+        k: usize,
+        n: usize,
+    },
 }
 
 impl Expr {
@@ -39,7 +64,10 @@ impl Expr {
         name: &str,
         dtype: DataType,
         size: usize,
-        packed_data: Vec<u8>,
+        packed_data: PackedBuffer,
+        shape: Vec<usize>,
+        bit_strides: Vec<usize>,
+        bit_offset: usize,
         scale: Option<u32>,
         steal_sign: bool,
     ) -> Self {
@@ -49,6 +77,9 @@ impl Expr {
             dtype,
             size,
             packed_data,
+            shape,
+            bit_strides,
+            bit_offset,
             scale,
             steal_sign,
         }
@@ -92,6 +123,7 @@ impl Expr {
             Expr::Constant { val } => val.data_type(),
             Expr::Add { left, .. } | Expr::Sub { left, .. }
             | Expr::Mul { left, .. } | Expr::Div { left, .. } => left.data_type(),
+            Expr::DequantizeMatmul { .. } => DataType::Float(32), // Standard inference fp32 output
         }
     }
 
@@ -105,6 +137,7 @@ impl Expr {
                 let r = right.size();
                 if l > r { l } else { r }
             }
+            Expr::DequantizeMatmul { m, n, .. } => *m * *n,
         }
     }
 
@@ -119,6 +152,7 @@ impl Expr {
             | Expr::Mul { left, right } | Expr::Div { left, right } => {
                 left.get_scale().or_else(|| right.get_scale())
             }
+            Expr::DequantizeMatmul { .. } => None,
         }
     }
 
@@ -128,6 +162,7 @@ impl Expr {
             Expr::Constant { .. } => false,
             Expr::Add { left, .. } | Expr::Sub { left, .. }
             | Expr::Mul { left, .. } | Expr::Div { left, .. } => left.steal_sign(),
+            Expr::DequantizeMatmul { .. } => false,
         }
     }
 
@@ -185,6 +220,7 @@ impl Expr {
                 let numer = dl.mul(b).sub((**left).clone().mul(dr));
                 numer.div(b_sq)
             }
+            Expr::DequantizeMatmul { .. } => unimplemented!("Gradient of DequantizeMatmul not yet implemented"),
         }
     }
 }

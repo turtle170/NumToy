@@ -82,7 +82,7 @@ jobs:
       - name: Install Zig ${{ env.ZIG_VERSION }}
         shell: bash
         run: |
-          ZIG_BASE="zig-${{ matrix.zig-os }}-${{ matrix.zig-arch }}-${{ env.ZIG_VERSION }}"
+          ZIG_BASE="zig-${{ matrix.zig-arch }}-${{ matrix.zig-os }}-${{ env.ZIG_VERSION }}"
           ZIG_URL="https://ziglang.org/download/${{ env.ZIG_VERSION }}/${ZIG_BASE}.${{ matrix.zig-ext }}"
           echo "Downloading $ZIG_URL"
           curl -fsSL "$ZIG_URL" -o zig-pkg.${{ matrix.zig-ext }}

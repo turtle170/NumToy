@@ -2,18 +2,80 @@ pub mod types;
 pub mod hardware;
 pub mod ir;
 pub mod fuser;
-pub mod tensor;
+pub mod array;
 pub mod graph;
 pub mod cache;
 pub mod pool;
+pub mod gpu;
+pub mod calculator;
+pub mod jit;
 
 use pyo3::prelude::*;
 use crate::types::{DataType, Scalar};
 use crate::hardware::HardwareEngine;
 use crate::ir::Expr;
-use crate::tensor::execute_expr_on_device;
-use crate::tensor::Tensor;
+use crate::array::execute_expr_on_device;
+use crate::array::NumToyArray;
 use std::sync::Arc;
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Default = 0,
+    Eager   = 1,
+    /// Hyper: `THREAD_PRIORITY_TIME_CRITICAL` on Windows; crossbeam pool spins before yielding.
+    Hyper   = 2,
+    /// Xtreme: everything Hyper does **plus** —
+    ///   • `REALTIME_PRIORITY_CLASS` for the whole process (Windows)
+    ///   • Worker threads spin *forever* — no yield, no sleep
+    ///   • All threads steal from all peer queues (not just assemblers)
+    ///   • `Tile → Assemble` directly, bypassing the Fuse optimization pass
+    ///   • Submit skips the JIT-cache probe; the Assemble handler deduplicates
+    ///   • `_mm_prefetch` on graph nodes before JIT compilation
+    ///   • Cranelift alias analysis enabled for better kernel code
+    Xtreme  = 3,
+}
+
+pub static GLOBAL_EXECUTION_MODE: AtomicU8 = AtomicU8::new(0);
+
+pub fn get_execution_mode() -> ExecutionMode {
+    match GLOBAL_EXECUTION_MODE.load(Ordering::Relaxed) {
+        1 => ExecutionMode::Eager,
+        2 => ExecutionMode::Hyper,
+        3 => ExecutionMode::Xtreme,
+        _ => ExecutionMode::Default,
+    }
+}
+
+pub fn set_execution_mode(mode: ExecutionMode) {
+    let is_xtreme = mode == ExecutionMode::Xtreme;
+
+    GLOBAL_EXECUTION_MODE.store(mode as u8, Ordering::Relaxed);
+
+    // Flip the fast-path bool used in every worker hot-loop iteration.
+    crate::pool::XTREME_ACTIVE.store(is_xtreme, Ordering::Relaxed);
+
+    // In Xtreme mode, elevate the *entire process* to REALTIME_PRIORITY_CLASS
+    // (Windows). This places the process above nearly every other process,
+    // including many driver threads — the caller accepts that trade-off.
+    // Exiting Xtreme mode resets to NORMAL_PRIORITY_CLASS.
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, SetPriorityClass,
+            REALTIME_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+        };
+        unsafe {
+            let _ = SetPriorityClass(
+                GetCurrentProcess(),
+                if is_xtreme { REALTIME_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS },
+            );
+        }
+    }
+
+    crate::pool::update_pool_mode();
+}
 
 // ─────────────────────────────────────────────────────────
 // AdaptableFloat Sign Stealer analysis
@@ -23,6 +85,17 @@ fn should_steal_sign(dtype: DataType, values: &[f64]) -> bool {
         DataType::Float(_) | DataType::DynamicFloat | DataType::ScalableFloat(_, _) => values.iter().all(|&v| v >= 0.0),
         _ => false,
     }
+}
+
+#[pyfunction]
+pub fn set_execution_mode_py(mode: &str) {
+    let m = match mode {
+        "eager"  => ExecutionMode::Eager,
+        "hyper"  => ExecutionMode::Hyper,
+        "xtreme" => ExecutionMode::Xtreme,
+        _        => ExecutionMode::Default,
+    };
+    set_execution_mode(m);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -121,7 +194,7 @@ impl PyExpr {
         };
         let packed = engine.inner.pack(&u64s, bit_width);
 
-        Self { inner: Expr::new_var(id, &name, dtype, values.len(), packed, scale, steal_sign) }
+        Self { inner: Expr::new_var(id, &name, dtype, values.len(), crate::ir::PackedBuffer::Memory(std::sync::Arc::new(packed)), vec![values.len()], crate::array::row_major_bit_strides(&[values.len()], dtype.bit_width() as usize), 0, scale, steal_sign) }
     }
 
     #[staticmethod]
@@ -166,7 +239,7 @@ impl PyExpr {
                     DataType::ScalableInt(b) => *b,
                     DataType::ScalableFloat(b, _) => *b,
                 };
-                let raw = engine.inner.unpack(packed_data, *size, bit_width);
+                let raw = engine.inner.unpack(packed_data.as_slice(), *size, bit_width);
                 let k = ((bit_width + 63) / 64) as usize;
                 raw.chunks_exact(k)
                     .map(|limbs| Scalar::from_limbs(limbs, *dtype, *scale, *steal_sign).to_double())
@@ -181,10 +254,10 @@ impl PyExpr {
 // Python: PyTensor
 // ─────────────────────────────────────────────────────────
 
-#[pyclass]
+#[pyclass(name="NumToyArray")]
 #[derive(Clone)]
 pub struct PyTensor {
-    pub inner: Tensor,
+    pub inner: crate::array::NumToyArray,
 }
 
 #[pymethods]
@@ -247,11 +320,66 @@ impl PyTensor {
         let bit_width = match dtype {
             DataType::Float(b) | DataType::Int(b) => b,
             DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => b,
-            _ => 64,
+            DataType::DynamicFloat | DataType::FloatingInt => 64,
         };
         let packed = engine.inner.pack(&u64s, bit_width);
-        let expr = Expr::new_var(id, &name, dtype, values.len(), packed, scale, steal_sign);
-        Self { inner: Tensor::from_expr(expr, shape) }
+        let expr = Expr::new_var(id, &name, dtype, values.len(), crate::ir::PackedBuffer::Memory(std::sync::Arc::new(packed)), vec![values.len()], crate::array::row_major_bit_strides(&[values.len()], dtype.bit_width() as usize), 0, scale, steal_sign);
+        Self { inner: crate::array::NumToyArray::from_expr(expr.clone(), shape.clone(), crate::array::row_major_bit_strides(&shape, expr.data_type().bit_width() as usize)) }
+    }
+
+    #[staticmethod]
+    pub fn from_mmap(
+        id: usize,
+        name: String,
+        filepath: &str,
+        count: usize,
+        shape: Vec<usize>,
+        dtype_str: &str,
+        bits: u32,
+        scale: Option<u32>,
+    ) -> PyResult<Self> {
+        let dtype = match dtype_str {
+            "float"         => DataType::Float(bits),
+            "int"           => DataType::Int(bits),
+            "dynamic_float" => DataType::DynamicFloat,
+            "floating_int"  => DataType::FloatingInt,
+            "scalable_int"  => DataType::ScalableInt(bits),
+            "scalable_float"=> DataType::ScalableFloat(bits, 4), // Placeholder exponent bits
+            _               => panic!("Unknown datatype: {}", dtype_str),
+        };
+
+        let file = std::fs::File::open(filepath)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        
+        let steal_sign = false; // mmap loaded arrays cannot compute dynamic sign-stealing trivially
+        let expr = Expr::new_var(id, &name, dtype, count, crate::ir::PackedBuffer::Mmap(std::sync::Arc::new(mmap)), vec![count], crate::array::row_major_bit_strides(&[count], dtype.bit_width() as usize), 0, scale, steal_sign);
+        Ok(Self { inner: crate::array::NumToyArray::from_expr(expr.clone(), shape.clone(), crate::array::row_major_bit_strides(&shape, expr.data_type().bit_width() as usize)) })
+    }
+
+    #[staticmethod]
+    pub fn dequantize_matmul(
+        activations: &PyTensor,
+        weights: &PyTensor,
+    ) -> Self {
+        let mut shape = vec![1, 1];
+        let mut m = 1;
+        let mut k = 1;
+        let mut n = 1;
+        if activations.inner.shape.len() >= 2 && weights.inner.shape.len() >= 2 {
+            m = activations.inner.shape[0];
+            k = activations.inner.shape[1];
+            n = weights.inner.shape[1];
+            shape = vec![m, n];
+        }
+        let new_expr = Expr::DequantizeMatmul {
+            activations: std::sync::Arc::new(activations.inner.expr.clone()),
+            weights: std::sync::Arc::new(weights.inner.expr.clone()),
+            m,
+            k,
+            n,
+        };
+        let strides = crate::array::row_major_bit_strides(&shape, 64); // output is f64
+        Self { inner: crate::array::NumToyArray::from_expr(new_expr, shape, strides) }
     }
 
     pub fn shape(&self) -> Vec<usize> {
@@ -294,6 +422,105 @@ impl PyTensor {
     pub fn to_flat_f64(&self, engine: &PyEngine) -> Vec<f64> {
         self.inner.to_flat_f64(&engine.inner)
     }
+
+    #[getter]
+    pub fn __array_interface__<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+        let dict = pyo3::types::PyDict::new(py);
+        
+        let shape_tuple = pyo3::types::PyTuple::new(py, &self.inner.shape).unwrap();
+        dict.set_item("shape", shape_tuple)?;
+        
+        let mut byte_strides = Vec::new();
+        for s in &self.inner.bit_strides {
+            if s % 8 != 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err("Cannot expose non-byte-aligned strides via __array_interface__"));
+            }
+            byte_strides.push(s / 8);
+        }
+        let strides_tuple = pyo3::types::PyTuple::new(py, &byte_strides).unwrap();
+        dict.set_item("strides", strides_tuple)?;
+        
+        let typestr = match self.inner.expr.data_type() {
+            crate::types::DataType::Float(32) => "<f4",
+            crate::types::DataType::Float(64) => "<f8",
+            crate::types::DataType::Int(8) => "<i1",
+            crate::types::DataType::Int(16) => "<i2",
+            crate::types::DataType::Int(32) => "<i4",
+            crate::types::DataType::Int(64) => "<i8",
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("Cannot expose custom bit-types, fixed-point, or scalable types via zero-copy __array_interface__")),
+        };
+        dict.set_item("typestr", typestr)?;
+        dict.set_item("version", 3)?;
+        
+        match &self.inner.expr {
+            crate::ir::Expr::Variable { packed_data, bit_offset, steal_sign, .. } => {
+                if *steal_sign {
+                    return Err(pyo3::exceptions::PyValueError::new_err("Cannot expose sign-stolen AdaptableFloat arrays via zero-copy __array_interface__"));
+                }
+                if bit_offset % 8 != 0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err("Cannot expose non-byte-aligned offset via __array_interface__"));
+                }
+                let ptr = packed_data.as_slice().as_ptr() as usize + (bit_offset / 8);
+                let data_tuple = pyo3::types::PyTuple::new(py, vec![ptr, 0]).unwrap();
+                dict.set_item("data", data_tuple)?; // tuple of pointer and readonly flag
+            }
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("Cannot expose unmaterialized array. Call execute() first.")),
+        }
+        
+        Ok(dict)
+    }
+
+    pub fn slice_and_dice(&self, ranges: Vec<(usize, usize, usize)>) -> Self {
+        let mut new_shape = Vec::new();
+        let mut new_strides = Vec::new();
+        
+        let (packed_data, mut bit_offset, scale, steal_sign, dtype, id, name) = match &self.inner.expr {
+            crate::ir::Expr::Variable { packed_data, bit_offset, scale, steal_sign, dtype, id, name, .. } => {
+                (packed_data.clone(), *bit_offset, *scale, *steal_sign, *dtype, *id, name.clone())
+            }
+            _ => panic!("Can only slice materialized variables currently"),
+        };
+
+        for (i, &(start, stop, step)) in ranges.iter().enumerate() {
+            let dim_size = self.inner.shape[i];
+            let actual_stop = stop.min(dim_size);
+            let span = actual_stop.saturating_sub(start);
+            if span > 0 {
+                let elements = (span + step - 1) / step;
+                new_shape.push(elements);
+                new_strides.push(self.inner.bit_strides[i] * step);
+                bit_offset += start * self.inner.bit_strides[i];
+            } else {
+                new_shape.push(0);
+                new_strides.push(self.inner.bit_strides[i]);
+            }
+        }
+        
+        for i in ranges.len()..self.inner.shape.len() {
+            new_shape.push(self.inner.shape[i]);
+            new_strides.push(self.inner.bit_strides[i]);
+        }
+        
+        let new_expr = crate::ir::Expr::Variable {
+            id,
+            name,
+            dtype,
+            size: new_shape.iter().product(),
+            packed_data,
+            shape: new_shape.clone(),
+            bit_strides: new_strides.clone(),
+            bit_offset,
+            scale,
+            steal_sign,
+        };
+        
+        Self { inner: crate::array::NumToyArray::from_expr(new_expr, new_shape, new_strides) }
+    }
+
+    pub fn transpose(&self) -> Self {
+        Self { inner: self.inner.transpose() }
+    }
+
 }
 
 // ─────────────────────────────────────────────────────────
@@ -305,6 +532,7 @@ fn numtoy_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
     m.add_class::<PyExpr>()?;
     m.add_class::<PyTensor>()?;
+    m.add_function(wrap_pyfunction!(set_execution_mode_py, m)?)?;
     Ok(())
 }
 
@@ -386,7 +614,7 @@ pub unsafe extern "C" fn nt_expr_new_var(
         _ => 64,
     };
     let packed = engine_ref.pack(&u64s, bit_width);
-    let expr = Expr::new_var(id, name_str, dtype, count, packed, Some(scale), steal_sign);
+    let expr = Expr::new_var(id, name_str, dtype, count, crate::ir::PackedBuffer::Memory(std::sync::Arc::new(packed)), vec![count], crate::array::row_major_bit_strides(&[count], dtype.bit_width() as usize), 0, Some(scale), steal_sign);
     Box::into_raw(Box::new(expr))
 }
 
@@ -453,7 +681,7 @@ pub unsafe extern "C" fn nt_expr_unpack(
                 DataType::ScalableInt(b) | DataType::ScalableFloat(b, _) => *b,
                 _ => 64,
             };
-            let raw = (*engine).unpack(packed_data, *size, bit_width);
+            let raw = (*engine).unpack(packed_data.as_slice(), *size, bit_width);
             let count = std::cmp::min(*size, max_count);
             let k = ((bit_width + 63) / 64) as usize;
             for i in 0..count {
@@ -473,7 +701,7 @@ pub unsafe extern "C" fn nt_expr_unpack(
 
 #[repr(C)]
 pub struct CppTensor {
-    inner: Tensor,
+    inner: crate::array::NumToyArray,
 }
 
 #[no_mangle]
@@ -493,7 +721,7 @@ pub unsafe extern "C" fn nt_tensor_new(
     if expr_ptr.is_null() { return std::ptr::null_mut(); }
     let expr = *Box::from_raw(expr_ptr);
     let shape = std::slice::from_raw_parts(shape_ptr, shape_len).to_vec();
-    let tensor = Tensor::from_expr(expr, shape);
+    let tensor = crate::array::NumToyArray::from_expr(expr.clone(), shape.clone(), crate::array::row_major_bit_strides(&shape, expr.data_type().bit_width() as usize));
     Box::into_raw(Box::new(CppTensor { inner: tensor }))
 }
 
@@ -527,14 +755,14 @@ pub unsafe extern "C" fn nt_tensor_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::execute_expr_on_device;
+    use crate::array::execute_expr_on_device;
 
     fn make_var(engine: &HardwareEngine, id: usize, values: &[f64]) -> Expr {
         let steal = values.iter().all(|&v| v >= 0.0);
         let scalars: Vec<Scalar> = values.iter().map(|&v| Scalar::Float(v, 32)).collect();
         let u64s: Vec<u64> = scalars.iter().flat_map(|s| s.to_limbs(steal)).collect();
         let packed = engine.pack(&u64s, 32);
-        Expr::new_var(id, &format!("v{id}"), DataType::Float(32), values.len(), packed, None, steal)
+        Expr::new_var(id, &format!("v{id}"), DataType::Float(32), values.len(), crate::ir::PackedBuffer::Memory(std::sync::Arc::new(packed)), vec![values.len()], crate::array::row_major_bit_strides(&[values.len()], DataType::Float(32).bit_width() as usize), 0, None, steal)
     }
 
     #[test]
@@ -547,7 +775,7 @@ mod tests {
         match result {
             Expr::Variable { size, packed_data, dtype, scale, steal_sign, .. } => {
                 assert_eq!(size, 3);
-                let raw = engine.unpack(&packed_data, size, 32);
+                let raw = engine.unpack(packed_data.as_slice(), size, 32);
                 let vals: Vec<f64> = raw.into_iter()
                     .map(|u| Scalar::from_u64_packed(u, dtype, scale, steal_sign).to_double())
                     .collect();
@@ -571,7 +799,7 @@ mod tests {
         let result = execute_expr_on_device(&engine, &dz_dx, "cpu");
         match result {
             Expr::Variable { size, packed_data, dtype, scale, steal_sign, .. } => {
-                let raw = engine.unpack(&packed_data, size, 32);
+                let raw = engine.unpack(packed_data.as_slice(), size, 32);
                 let val = Scalar::from_u64_packed(raw[0], dtype, scale, steal_sign).to_double();
                 assert!((val - 7.0).abs() < 0.5, "d(z)/d(x) = {} expected 7.0", val);
             }
@@ -587,8 +815,16 @@ mod tests {
         let engine = HardwareEngine::new();
         let a_expr = make_var(&engine, 1, &[1.0, 2.0, 3.0]);
         let b_expr = make_var(&engine, 2, &[10.0, 20.0]);
-        let a = Tensor::from_expr(a_expr, vec![3, 1]);
-        let b = Tensor::from_expr(b_expr, vec![1, 2]);
+        let a = crate::array::NumToyArray::from_expr(
+            a_expr.clone(),
+            vec![3, 1],
+            crate::array::row_major_bit_strides(&[3, 1], a_expr.data_type().bit_width() as usize),
+        );
+        let b = crate::array::NumToyArray::from_expr(
+            b_expr.clone(),
+            vec![1, 2],
+            crate::array::row_major_bit_strides(&[1, 2], b_expr.data_type().bit_width() as usize),
+        );
         let c = a.add(&b, &engine).execute(&engine, "cpu");
         let flat = c.to_flat_f64(&engine);
         assert_eq!(flat.len(), 6);
